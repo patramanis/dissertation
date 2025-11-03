@@ -4,9 +4,9 @@ import pandas as pd
 import pandas_market_calendars as mcal
 from datetime import datetime
 
-# --- Ticket search for each ETF ---
+# --- ETF Tickets---
 TICKERS = ['XLK', 'XLE', 'XLF', 'XLV', 'XLU', 'XLI', 'XLB', 'XLY', 'XLP']
-START_DATE = '1999-01-01'
+START_DATE = '2000-08-30'
 END_DATE = '2025-09-30'
 DATA_DIR = "data"
 FILE_PATH = os.path.join(DATA_DIR, "sector_data.csv")
