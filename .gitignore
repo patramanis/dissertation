@@ -214,7 +214,11 @@ data/*.csv
 # ---- Python ----
 # Αγνοεί τον φάκελο του virtual environment
 .venv/
+.venv312/
 
 # Αγνοεί τα αρχεία cache της Python
 __pycache__/
 *.pyc
+
+# Results artifacts
+results/
