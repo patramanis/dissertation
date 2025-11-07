@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 # Non-interactive backend for saving plots
 import matplotlib
@@ -20,10 +21,12 @@ from sklearn.metrics import (
 
 # Paths
 DATA_PATH = os.path.join("data", "model_ready_data.csv")
-# Baseline output layout
+# Baseline output layout (timestamped runs)
 BASELINE_ROOT = os.path.join("results", "baseline")
-PER_SECTOR_ROOT = os.path.join(BASELINE_ROOT, "per_sector")
-SUMMARY_ROOT = os.path.join(BASELINE_ROOT, "summary")
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_ROOT = os.path.join(BASELINE_ROOT, "runs", RUN_TIMESTAMP)
+PER_SECTOR_ROOT = os.path.join(RUN_ROOT, "per_sector")
+SUMMARY_ROOT = os.path.join(RUN_ROOT, "summary")
 
 # CV and model config (env override via BASELINE_N_SPLITS)
 N_SPLITS = int(os.getenv("BASELINE_N_SPLITS", 5))
@@ -205,9 +208,10 @@ def run_sector_baseline(sector_name, X, y, base_results_dir):
 
 
 def main():
-    print("--- Baseline model run started ---")
+    print(f"--- Baseline model run started (Run: {RUN_TIMESTAMP}) ---")
     # Ensure output folders
     ensure_dir(BASELINE_ROOT)
+    ensure_dir(RUN_ROOT)
     ensure_dir(PER_SECTOR_ROOT)
     ensure_dir(SUMMARY_ROOT)
 
@@ -232,7 +236,8 @@ def main():
     # Save summary
     df_summary.to_csv(os.path.join(SUMMARY_ROOT, "Sectors_Symmary.csv"), index=False)
 
-    print("Baseline analysis complete. Summary saved to results.")
+    print(f"Baseline analysis complete. Results saved to {RUN_ROOT}")
+
 
 if __name__ == "__main__":
     main()

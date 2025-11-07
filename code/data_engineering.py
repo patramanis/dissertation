@@ -1,6 +1,12 @@
 import os
 import numpy as np
 import pandas as pd
+try:
+    from hurst import compute_Hc  # type: ignore
+    HURST_AVAILABLE = True
+except ImportError:
+    HURST_AVAILABLE = False
+    print("Warning: 'hurst' library not found. Skipping Hurst Exponent features.")
 
 SECTOR_PATH = os.path.join("data", "sector_data.csv")
 FEATURES_PATH = os.path.join("data", "features_data.csv")
@@ -164,6 +170,45 @@ def add_interactions(df):
     return df
 
 
+def add_hurst_features(df, feature_list):
+    """Rolling Hurst exponent for selected columns over multiple windows.
+    Outputs <col>_hurst_<W> for W in {21,63,126,252}. Lags are added later.
+    """
+    if not HURST_AVAILABLE:
+        return df
+
+    HURST_WINDOWS = [21, 63, 126, 252]
+
+    def _safe_hurst(x: np.ndarray) -> float:
+        try:
+            h, _, _ = compute_Hc(x)
+            return float(h) if np.isfinite(h) else np.nan
+        except Exception:
+            return np.nan
+
+    print("Calculating rolling Hurst Exponent (multi-window; this will be slow)...")
+
+    out_frames = []
+    for col in feature_list:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors='coerce')
+        for W in HURST_WINDOWS:
+            h = series.rolling(window=W, min_periods=W).apply(_safe_hurst, raw=True)
+            h.name = f"{col}_hurst_{W}"
+            out_frames.append(h)
+
+    if out_frames:
+        df = pd.concat([df] + out_frames, axis=1)
+        # Drop Hurst columns that are entirely NaN (prevent row wipeout at dropna)
+        hurst_cols_added = [s.name for s in out_frames]
+        all_nan_cols = [c for c in hurst_cols_added if df[c].isna().all()]
+        if all_nan_cols:
+            print(f"[HURST] Dropping {len(all_nan_cols)} all-NaN Hurst columns")
+            df.drop(columns=all_nan_cols, inplace=True)
+    return df
+
+
 def final_cleanup_and_save(df):
     # Replace inf, drop NaNs, save
     df = df.replace([np.inf, -np.inf], np.nan)
@@ -178,6 +223,14 @@ def main():
     print("--- Feature engineering started ---")
     # Load
     df_master, sector_columns, feature_columns, gpr_df = load_inputs()
+    
+    # Add Sector Ratio (Economic Feature)
+    if 'XLY' in df_master.columns and 'XLP' in df_master.columns:
+        print("Calculating XLY/XLP Sector Ratio feature...")
+        df_master['XLY_div_XLP'] = df_master['XLY'] / (df_master['XLP'] + 1e-6)
+    else:
+        print("Warning: XLY or XLP not found. Skipping Sector Ratio feature.")
+    
     # Targets
     df_master = add_targets(df_master, sector_columns)
     # Base features
@@ -187,12 +240,21 @@ def main():
     df_master = add_realized_vol_features(df_master, all_return_cols)
     # GPR
     df_master = handle_gpr(df_master, gpr_df)
+    # Step 4.5: Rolling Hurst (momentum/memory) features
+    hurst_cols = feature_columns + sector_columns
+    df_master = add_hurst_features(df_master, hurst_cols)
+    
+    # Register new features in feature_columns before building systematic list
+    if 'XLY_div_XLP' in df_master.columns:
+        feature_columns.append('XLY_div_XLP')
+    
     # Build feature list
     systematic_feature_list = feature_columns.copy()
     if 'GPR' in df_master.columns:
         systematic_feature_list.append('GPR')
     systematic_feature_list.extend([col for col in df_master.columns if '_return' in col])
     systematic_feature_list.extend([col for col in df_master.columns if '_realized_vol_' in col])
+    systematic_feature_list.extend([col for col in df_master.columns if '_hurst_' in col])
 
     print(f"Total features to process for lags/rolling: {len(systematic_feature_list)}")
     # Lags & rolling
