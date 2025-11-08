@@ -72,9 +72,11 @@ def load_all_daily_features(master_index, start_date, end_date):
             if col in final_features.columns:
                 final_features[col] = final_features[col].ffill(limit=5)
 
-        # Forward-fill GPR (monthly) across trading days
+        # Fill GPR (monthly data) - use first-of-month value for entire month
         if 'GPR' in final_features.columns:
-            final_features['GPR'] = final_features['GPR'].ffill()
+            # Method: 'ffill' propagates each monthly value forward until next month
+            # For any initial NaN (before first GPR date), use first available value
+            final_features['GPR'] = final_features['GPR'].fillna(method='ffill').fillna(method='bfill')
 
         final_features['SPREAD_10Y_13W'] = final_features['TNX'] - final_features['IRX']
         final_features.to_csv(FEATURES_DATA_PATH)
