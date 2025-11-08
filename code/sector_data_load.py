@@ -4,8 +4,8 @@ import pandas as pd
 import pandas_market_calendars as mcal
 from datetime import datetime
 
-# --- ETF Tickets---
-TICKERS = ['XLK', 'XLE', 'XLF', 'XLV', 'XLU', 'XLI', 'XLB', 'XLY', 'XLP']
+# --- ETF Tickers---
+TICKERS = ['SPY', 'XLK', 'XLE', 'XLF', 'XLV', 'XLU', 'XLI', 'XLB', 'XLY', 'XLP']
 START_DATE = '2000-08-30'
 END_DATE = '2025-09-30'
 DATA_DIR = "data"

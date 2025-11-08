@@ -222,3 +222,22 @@ __pycache__/
 
 # Results artifacts
 results/
+
+# Diagnostic and temporary files
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*_diagnostic*.txt
+*_analysis*.txt
+*_report*.txt
+shap_*.csv
+feature_importance*.csv
+calibration_*.csv
+temp/
+tmp/
+*.tmp
+*.temp
+*~
+.DS_Store
