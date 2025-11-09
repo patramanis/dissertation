@@ -115,8 +115,19 @@ def train_and_evaluate(X, y):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         
-        # Train model
-        model = XGBClassifier(**XGB_PARAMS)
+        # Calculate class balance for this fold
+        n_neg = (y_train == 0).sum()
+        n_pos = (y_train == 1).sum()
+        scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+        
+        print(f"  Class balance: {n_neg} neg, {n_pos} pos")
+        print(f"  scale_pos_weight: {scale_pos_weight:.3f}")
+        
+        # Train model with class balancing
+        xgb_params = XGB_PARAMS.copy()
+        xgb_params['scale_pos_weight'] = scale_pos_weight
+        
+        model = XGBClassifier(**xgb_params)
         model.fit(X_train, y_train, verbose=False)
         
         # Predictions
@@ -128,6 +139,7 @@ def train_and_evaluate(X, y):
             'fold': fold,
             'train_size': len(train_idx),
             'test_size': len(test_idx),
+            'scale_pos_weight': scale_pos_weight,
             'accuracy': accuracy_score(y_test, y_pred),
             'auc': roc_auc_score(y_test, y_proba),
             'f1': f1_score(y_test, y_pred),
@@ -300,12 +312,13 @@ def save_results(output_dir, fold_metrics, summary, feature_cols, model):
 
 def main():
     print(f"\n{'='*80}")
-    print("XGBOOST CLASSIFICATION MODEL - PRODUCTION TRAINING")
+    print("XGBOOST CLASSIFICATION MODEL - WITH CLASS BALANCING")
     print(f"{'='*80}")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Sector: {SECTOR}")
     print(f"Horizon: {HORIZON} days")
     print(f"CV Splits: {N_SPLITS}")
+    print(f"Improvement: Auto class balancing (scale_pos_weight per fold)")
     
     # Create output directory with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -325,6 +338,22 @@ def main():
     
     # Calculate summary metrics
     summary = calculate_summary_metrics(fold_metrics, all_y_true, all_y_pred, all_y_proba)
+    
+    # Print comparison to baseline
+    print(f"\n{'='*80}")
+    print("COMPARISON TO BASELINE")
+    print(f"{'='*80}")
+    baseline_auc = 0.5718
+    baseline_recall_std = 0.2898
+    improvement_auc = summary['overall_auc'] - baseline_auc
+    improvement_recall_std = baseline_recall_std - summary['recall_std']
+    
+    print(f"Baseline AUC:           {baseline_auc:.4f}")
+    print(f"Class Balanced AUC:     {summary['overall_auc']:.4f}")
+    print(f"Improvement:            {improvement_auc:+.4f} ({100*improvement_auc/baseline_auc:+.1f}%)")
+    print(f"\nBaseline Recall Std:    {baseline_recall_std:.4f}")
+    print(f"Class Balanced Std:     {summary['recall_std']:.4f}")
+    print(f"Stability Improvement:  {improvement_recall_std:+.4f} ({100*improvement_recall_std/baseline_recall_std:+.1f}%)")
     
     # Compute SHAP importance
     shap_df = compute_shap_importance(model, X, feature_cols, output_dir)
