@@ -206,19 +206,40 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Αγνοεί όλα τα αρχεία CSV μέσα στο φάκελο data,
+
 data/*.csv
 !data/EPU.csv
 !data/GPR.csv
 
 # ---- Python ----
-# Αγνοεί τον φάκελο του virtual environment
 .venv/
 .venv312/
-
-# Αγνοεί τα αρχεία cache της Python
 __pycache__/
 *.pyc
 
+# Data files (except source data)
+data/*.csv
+!data/EPU.csv
+!data/GPR.csv
+
 # Results artifacts
+tests/
+tests/Findings/
 results/
+temporal_files/
+
+# Diagnostics and analysis files
+diagnostics/
+*.md
+!README.md
+
+# Plots and visualizations
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Temporary files
+*.tmp
+*.bak
+*~
