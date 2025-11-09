@@ -1,18 +1,11 @@
-"""
-SHAP-based feature interpretability analysis.
-Loads trained XGBoost model and explains predictions using SHAP.
-Saves: summary_plot.png, bar_plot.png, feature_importance.csv
-"""
 import os
 import pickle
 import json
 from typing import List, Tuple
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import shap
-from xgboost import XGBRegressor, XGBClassifier
 
 RESULTS_DIR = os.path.join("results")
 DATA_DIR = os.path.join("data")
@@ -45,7 +38,6 @@ def build_dataset(horizon: int, task: str = "regression"):
 
 
 def load_model_and_config():
-    """Load last trained model and config from results/"""
     model_path = os.path.join(RESULTS_DIR, "xgb_model.pkl")
     config_path = os.path.join(RESULTS_DIR, "xgb_config.json")
 
@@ -62,24 +54,20 @@ def load_model_and_config():
 
 
 def compute_shap_values(model, X: pd.DataFrame):
-    """Compute SHAP values using TreeExplainer."""
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
     return explainer, shap_values
 
 
 def save_shap_plots(explainer, shap_values, X: pd.DataFrame, feature_cols: List[str]):
-    """Save SHAP summary and bar plots."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # Summary plot (SHAP values vs feature values)
     plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values, X, feature_names=feature_cols, show=False)
     summary_path = os.path.join(RESULTS_DIR, "shap_summary_plot.png")
     plt.savefig(summary_path, dpi=100, bbox_inches="tight")
     plt.close()
 
-    # Bar plot (mean absolute SHAP value per feature)
     plt.figure(figsize=(10, 6))
     shap.summary_plot(shap_values, X, feature_names=feature_cols, plot_type="bar", show=False)
     bar_path = os.path.join(RESULTS_DIR, "shap_bar_plot.png")
@@ -92,10 +80,7 @@ def save_shap_plots(explainer, shap_values, X: pd.DataFrame, feature_cols: List[
 
 
 def save_feature_importance_csv(shap_values, feature_cols: List[str]):
-    """Save mean absolute SHAP per feature to CSV."""
-    # Handle both regression (1D array) and classification (list of arrays)
     if isinstance(shap_values, list):
-        # Multi-class or binary classification
         shap_values = shap_values[0] if len(shap_values) == 1 else np.mean(np.abs(shap_values), axis=0)
 
     mean_abs_shap = np.abs(shap_values).mean(axis=0)
