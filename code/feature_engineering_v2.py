@@ -21,7 +21,9 @@ OUTPUT_PATH = DATA_DIR / "engineered_features_v2.csv"
 LAG_PERIODS = [1, 2, 3, 5, 10, 21]
 ROLLING_WINDOWS = [5, 10, 21, 42, 63, 126, 252]
 SECTORS = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"]
-FEATURES = ["OIL", "USD", "GOLD", "IRX", "TNX", "VIX", "EPU", "GPR", "SPREAD_10Y_13W"]
+FEATURES = ["OIL", "USD", "GOLD", "IRX", "TNX", "VIX", "EPU", "GPR", "SPREAD_10Y_13W",
+            "Bullish", "Neutral", "Bearish", "Bullish_8wMA", "Bull_Bear_Spread", 
+            "Bull_Bear_Ratio", "Extreme_Bull", "Extreme_Bear"]
 
 def load_data():
     print("="*80)
@@ -34,7 +36,7 @@ def load_data():
     
     print("Loading features data...")
     features = pd.read_csv(FEATURES_DATA_PATH, parse_dates=["Date"])
-    print(f"  {len(features)} days, {len(FEATURES)} features")
+    print(f"  {len(features)} days, {len(features.columns)-1} features (including sentiment)")  # -1 for Date column
     
     print("Loading regime probabilities...")
     regimes = pd.read_csv(REGIME_PATH, parse_dates=["Date"])
