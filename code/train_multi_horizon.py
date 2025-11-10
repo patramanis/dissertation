@@ -63,10 +63,6 @@ def load_data(use_selected=True):
     return df
 
 def prepare_targets(df):
-    """
-    Create targets for multiple horizons.
-    CRITICAL: No data leakage - all features are already lagged by at least 1 day.
-    """
     print(f"\n{'='*80}")
     print("PREPARING MULTI-HORIZON TARGETS")
     print(f"{'='*80}")
@@ -108,10 +104,6 @@ def prepare_targets(df):
     return df, targets, pd.DataFrame(target_stats)
 
 def prepare_features(df, target_col):
-    """
-    Prepare features for a specific target.
-    NO DATA LEAKAGE: All features are pre-lagged in the dataset.
-    """
     # Feature columns: exclude Date, sectors, all targets, SPY_proxy, and 'target' column
     target_cols = [c for c in df.columns if c.startswith('target_')]
     exclude_cols = ['Date'] + SECTORS + target_cols + ['SPY_proxy', 'target']
@@ -128,9 +120,6 @@ def prepare_features(df, target_col):
     return X, y, dates, feature_cols
 
 def train_and_evaluate(X, y, horizon_name):
-    """
-    Train model for a specific horizon with Time Series CV and class balancing.
-    """
     print(f"\n{'='*80}")
     print(f"TRAINING MODEL: {horizon_name}")
     print(f"{'='*80}")
@@ -203,9 +192,6 @@ def train_and_evaluate(X, y, horizon_name):
     return fold_metrics, all_y_true, all_y_pred, all_y_proba, model, feature_importance
 
 def calculate_summary_metrics(fold_metrics, all_y_true, all_y_pred, all_y_proba):
-    """
-    Calculate aggregate metrics across folds.
-    """
     summary = {
         'accuracy_mean': np.mean([m['accuracy'] for m in fold_metrics]),
         'accuracy_std': np.std([m['accuracy'] for m in fold_metrics]),
@@ -234,9 +220,6 @@ def calculate_summary_metrics(fold_metrics, all_y_true, all_y_pred, all_y_proba)
     return summary
 
 def save_results(run_dir, horizon_name, fold_metrics, summary, feature_importance):
-    """
-    Save results for a specific horizon.
-    """
     horizon_dir = run_dir / horizon_name
     horizon_dir.mkdir(parents=True, exist_ok=True)
     
@@ -254,9 +237,6 @@ def save_results(run_dir, horizon_name, fold_metrics, summary, feature_importanc
     print(f"\nResults saved to: {horizon_dir}")
 
 def create_comparison_plots(all_results, run_dir):
-    """
-    Create comparison plots across horizons.
-    """
     print(f"\n{'='*80}")
     print("CREATING COMPARISON PLOTS")
     print(f"{'='*80}")
@@ -334,9 +314,6 @@ def create_comparison_plots(all_results, run_dir):
     return df_metrics
 
 def analyze_feature_consistency(all_results, run_dir):
-    """
-    Analyze which features are consistently important across horizons.
-    """
     print(f"\n{'='*80}")
     print("ANALYZING FEATURE CONSISTENCY")
     print(f"{'='*80}")
@@ -527,9 +504,6 @@ def identify_missing_features(df_consistency, all_results):
     return recommendations, feature_types
 
 def print_recommendations(recommendations, feature_types, df_metrics):
-    """
-    Print comprehensive recommendations.
-    """
     print("\n" + "="*80)
     print("PRIORITY RECOMMENDATIONS TO STRENGTHEN SIGNAL")
     print("="*80)
