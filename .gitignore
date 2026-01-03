@@ -206,10 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Αγνοεί όλα τα αρχεία CSV μέσα στο φάκελο data,
-data/*.csv
-!data/EPU.csv
-!data/GPR.csv
+
 
 # ---- Python ----
 # Αγνοεί τον φάκελο του virtual environment
@@ -224,6 +221,9 @@ __pycache__/
 results/
 
 # ---- Project-specific ignores ----
+code/
+data/
+
 FTI/
 
 ModularMonolith/**
