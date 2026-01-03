@@ -5,8 +5,10 @@ from pathlib import Path
 import pandas as pd
 
 
-RAW2_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
-OUT_PATH = Path("ModularMonolith") / "data" / "labels" / "labels.parquet"
+LABELS_DIR = Path(__file__).resolve().parent
+DATA_DIR = LABELS_DIR.parent
+RAW2_DIR = DATA_DIR / "raw_data_2"
+OUT_DIR = LABELS_DIR
 SPDR_PARQUET = RAW2_DIR / "SPDR.parquet"
 SPY_PARQUET = RAW2_DIR / "SPY.parquet"
 
@@ -61,9 +63,14 @@ def main() -> None:
     out = pd.concat(out_rows, ignore_index=True)
     out = out.sort_values(["Date", "Sector"]).reset_index(drop=True)
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(OUT_PATH, index=False, engine="pyarrow")
-    print(f"Wrote {OUT_PATH} shape={out.shape}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for h in horizons:
+        col = f"label_excess_{h}d"
+        out_h = out[["Date", "Sector", col]].copy()
+        out_path = OUT_DIR / f"h{h}.parquet"
+        out_h.to_parquet(out_path, index=False, engine="pyarrow")
+        print(f"Wrote {out_path} shape={out_h.shape}")
 
 
 if __name__ == "__main__":
