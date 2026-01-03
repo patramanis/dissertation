@@ -222,3 +222,13 @@ __pycache__/
 
 # Results artifacts
 results/
+
+# ---- Project-specific ignores ----
+FTI/
+
+ModularMonolith/**
+!ModularMonolith/**/
+!ModularMonolith/**/*.py
+
+ModularMonolith/data/**/*.parquet
+ModularMonolith/data/**/*.png
