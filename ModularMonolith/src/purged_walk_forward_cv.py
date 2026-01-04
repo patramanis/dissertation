@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
 
 import numpy as np
@@ -164,14 +165,28 @@ def plot_cv_indices(
     *,
     ax=None,
     title: str | None = None,
+    x_axis: str = "date",
 ):
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    import matplotlib.dates as mdates
 
     if ax is None:
         _, ax = plt.subplots(figsize=(12, 1 + 0.6 * cv.get_n_splits(X, y, groups)))
 
     n_samples = len(X)
+
+    if x_axis not in {"index", "date"}:
+        raise ValueError("x_axis must be 'index' or 'date'")
+
+    if x_axis == "date":
+        if groups is None:
+            raise ValueError("groups is required when x_axis='date'")
+        x = np.asarray(groups)
+        x_label = "Date"
+    else:
+        x = np.arange(n_samples)
+        x_label = "Sample index"
 
     cmap = mcolors.ListedColormap(["#ffffff", "#1f77b4", "#d62728"])
     norm = mcolors.BoundaryNorm([0, 1, 2, 3], cmap.N)
@@ -182,7 +197,7 @@ def plot_cv_indices(
         arr[test] = 2
 
         ax.scatter(
-            np.arange(n_samples),
+            x,
             np.full(n_samples, ii),
             c=arr,
             marker="|",
@@ -194,11 +209,170 @@ def plot_cv_indices(
 
     ax.set_yticks(np.arange(cv.get_n_splits(X, y, groups)))
     ax.set_yticklabels([f"split {i}" for i in range(cv.get_n_splits(X, y, groups))])
-    ax.set_xlabel("Sample index")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("CV split")
     if title is not None:
         ax.set_title(title)
-    ax.set_xlim(-1, n_samples)
+
+    if x_axis == "date":
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        try:
+            ax.set_xlim(x.min(), x.max())
+        except Exception:
+            pass
+    else:
+        ax.set_xlim(-1, n_samples)
     ax.grid(False)
 
     return ax
+
+
+def _repo_root() -> Path:
+    # .../dissertation/ModularMonolith/src/purged_walk_forward_cv.py -> .../dissertation
+    return Path(__file__).resolve().parents[2]
+
+
+def _dataset_dir() -> Path:
+    return _repo_root() / "ModularMonolith" / "data" / "dataset"
+
+
+def _out_dir() -> Path:
+    return _repo_root() / "ModularMonolith" / "data" / "traintestperiods"
+
+
+def _load_groups_from_keys(keys_path: Path) -> np.ndarray:
+    import pandas as pd
+
+    keys = pd.read_parquet(keys_path)
+    if "Date" not in keys.columns:
+        raise ValueError(f"Missing Date column in keys file: {keys_path}")
+    dt = pd.to_datetime(keys["Date"], errors="raise")
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_localize(None)
+    return dt.to_numpy()
+
+
+def _simulate_synthetic_price(dates: np.ndarray, *, seed: int = 123, start: float = 100.0) -> np.ndarray:
+    """Synthetic price series to visualize CV windows.
+
+    Uses a simple geometric random walk so the plotted line looks like a market price.
+    """
+
+    rng = np.random.default_rng(seed)
+    n = int(len(dates))
+    if n <= 0:
+        raise ValueError("dates must be non-empty")
+
+    # Daily log-return random walk (roughly 1% daily vol).
+    lr = rng.normal(loc=0.0, scale=0.01, size=n)
+    price = float(start) * np.exp(np.cumsum(lr))
+    return price
+
+
+def plot_cv_price_panels(
+    *,
+    cv: PurgedWalkForwardCV,
+    unique_dates: np.ndarray,
+    price: np.ndarray,
+    title: str,
+) -> "plt.Figure":
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    if len(unique_dates) != len(price):
+        raise ValueError("unique_dates and price must have same length")
+
+    n_splits = cv.get_n_splits()
+    fig_h = max(6.0, 0.55 * n_splits)
+    fig, axes = plt.subplots(n_splits, 1, figsize=(14, fig_h), sharex=True, constrained_layout=True)
+    if n_splits == 1:
+        axes = [axes]
+
+    groups = unique_dates
+    X_dummy = np.zeros((len(groups), 1), dtype=float)
+
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+    formatter = mdates.ConciseDateFormatter(locator)
+
+    for ax, (_, _, info) in zip(axes, cv.split_with_info(X_dummy, groups=groups), strict=False):
+        ax.plot(unique_dates, price, color="black", linewidth=1.0)
+
+        # Shade Train (blue) and Test (red). Purge gap remains unshaded by design.
+        if info.train_start is not None and info.train_end is not None:
+            ax.axvspan(
+                pd.Timestamp(info.train_start),
+                pd.Timestamp(info.train_end) + pd.Timedelta(days=1),
+                color="#1f77b4",
+                alpha=0.15,
+                lw=0,
+            )
+
+        ax.axvspan(
+            pd.Timestamp(info.test_start),
+            pd.Timestamp(info.test_end) + pd.Timedelta(days=1),
+            color="#d62728",
+            alpha=0.15,
+            lw=0,
+        )
+
+        ax.set_ylabel(f"fold {info.split_index}")
+        ax.grid(True, alpha=0.15)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+
+        t0 = str(info.train_start)[:10] if info.train_start is not None else "None"
+        t1 = str(info.train_end)[:10] if info.train_end is not None else "None"
+        s0 = str(info.test_start)[:10]
+        s1 = str(info.test_end)[:10]
+        ax.set_title(
+            f"Fold {info.split_index}: Train {t0} → {t1} | Purge gap={info.purge_gap} | Test {s0} → {s1}",
+            fontsize=9,
+        )
+
+    fig.suptitle(title, fontsize=12)
+    axes[-1].set_xlabel("Date")
+    return fig
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    horizons = (5, 21, 63)
+    dataset_dir = _dataset_dir()
+    out_dir = _out_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for h in horizons:
+        keys_path = dataset_dir / f"h{h}" / "keys.parquet"
+        if not keys_path.exists():
+            raise FileNotFoundError(keys_path)
+
+        groups = _load_groups_from_keys(keys_path)
+        unique_dates = np.unique(groups)
+        unique_dates = np.sort(unique_dates)
+        price = _simulate_synthetic_price(unique_dates, seed=123 + int(h), start=100.0)
+
+        purge_gap = int(h)
+        test_size = 126 if h == 63 else 63
+        n_splits = 10 if h == 63 else 20
+
+        cv = PurgedWalkForwardCV(
+            n_splits=n_splits,
+            test_size=test_size,
+            purge_gap=purge_gap,
+            embargo=0,
+        )
+
+        out_path = out_dir / f"cv_h{h}.png"
+
+        title = (
+            f"Purged Walk-Forward CV on synthetic price (h={h}) | "
+            f"folds={n_splits} | test_size={test_size} | purge_gap={purge_gap}"
+        )
+        fig = plot_cv_price_panels(cv=cv, unique_dates=unique_dates, price=price, title=title)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved CV plot: {out_path}")
