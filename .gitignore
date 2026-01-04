@@ -232,3 +232,6 @@ ModularMonolith/**
 
 ModularMonolith/data/**/*.parquet
 ModularMonolith/data/**/*.png
+
+ModularMonolith/data/**/Graphs/
+ModularMonolith/data/**/Graphs/**
