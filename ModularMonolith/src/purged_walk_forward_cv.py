@@ -93,14 +93,24 @@ class PurgedWalkForwardCV(BaseCrossValidator):
             train_groups = unique_groups[:train_end_idx]
 
             if embargoed_groups:
-                mask = np.array([g not in embargoed_groups for g in train_groups], dtype=bool)
-                train_groups = train_groups[mask]
+                embargoed_arr = np.fromiter(
+                    embargoed_groups,
+                    dtype=unique_groups.dtype,
+                    count=len(embargoed_groups),
+                )
+                train_groups = train_groups[~np.isin(train_groups, embargoed_arr)]
 
             train_mask = np.isin(groups_1d, train_groups)
             test_mask = np.isin(groups_1d, test_groups)
 
             train_index = np.flatnonzero(train_mask)
             test_index = np.flatnonzero(test_mask)
+
+            if train_index.size == 0:
+                raise RuntimeError(
+                    f"Split {i}: Training set is empty. "
+                    f"Too many splits ({self.n_splits}) or purge_gap ({self.purge_gap}) is too large for the dataset size."
+                )
 
             if self.embargo > 0:
                 emb_start = test_end_idx
@@ -132,11 +142,21 @@ class PurgedWalkForwardCV(BaseCrossValidator):
             train_groups = unique_groups[:train_end_idx]
 
             if embargoed_groups:
-                mask = np.array([g not in embargoed_groups for g in train_groups], dtype=bool)
-                train_groups = train_groups[mask]
+                embargoed_arr = np.fromiter(
+                    embargoed_groups,
+                    dtype=unique_groups.dtype,
+                    count=len(embargoed_groups),
+                )
+                train_groups = train_groups[~np.isin(train_groups, embargoed_arr)]
 
             train_index = np.flatnonzero(np.isin(groups_1d, train_groups))
             test_index = np.flatnonzero(np.isin(groups_1d, test_groups))
+
+            if train_index.size == 0:
+                raise RuntimeError(
+                    f"Split {i}: Training set is empty. "
+                    f"Too many splits ({self.n_splits}) or purge_gap ({self.purge_gap}) is too large for the dataset size."
+                )
 
             info = FoldInfo(
                 split_index=i,
@@ -230,7 +250,6 @@ def plot_cv_indices(
 
 
 def _repo_root() -> Path:
-    # .../dissertation/ModularMonolith/src/purged_walk_forward_cv.py -> .../dissertation
     return Path(__file__).resolve().parents[2]
 
 
@@ -265,7 +284,6 @@ def _simulate_synthetic_price(dates: np.ndarray, *, seed: int = 123, start: floa
     if n <= 0:
         raise ValueError("dates must be non-empty")
 
-    # Daily log-return random walk (roughly 1% daily vol).
     lr = rng.normal(loc=0.0, scale=0.01, size=n)
     price = float(start) * np.exp(np.cumsum(lr))
     return price
@@ -300,7 +318,6 @@ def plot_cv_price_panels(
     for ax, (_, _, info) in zip(axes, cv.split_with_info(X_dummy, groups=groups), strict=False):
         ax.plot(unique_dates, price, color="black", linewidth=1.0)
 
-        # Shade Train (blue) and Test (red). Purge gap remains unshaded by design.
         if info.train_start is not None and info.train_end is not None:
             ax.axvspan(
                 pd.Timestamp(info.train_start),
