@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -9,6 +10,20 @@ import pandas as pd
 
 INPUT_DIR = Path("ModularMonolith") / "data" / "raw_data_1"
 OUTPUT_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
+
+MANIFEST_PATH = OUTPUT_DIR / "raw_data_2_manifest.json"
+
+SECTORS: tuple[str, ...] = (
+    "XLB",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLY",
+    "XLV",
+    "XLU",
+)
 
 
 DAILY_FILES = {
@@ -155,6 +170,21 @@ def _build_pit_dataset(csv_path: Path, trading_dates: pd.DatetimeIndex) -> pd.Da
 
     value_cols = [c for c in df_raw.columns if c != "Date"]
 
+    if basename == "SPDR":
+        if all(s in value_cols for s in SECTORS):
+            value_cols = list(SECTORS)
+        else:
+            raise ValueError(
+                "SPDR.csv does not contain the expected sector adjusted-close columns. "
+                f"Expected={list(SECTORS)}; got={value_cols[:30]}"
+            )
+
+    if basename == "SPY":
+        if "SPY" in value_cols:
+            value_cols = ["SPY"]
+        else:
+            raise ValueError(f"SPY.csv missing expected column 'SPY'; got={value_cols[:30]}")
+
     policy = _policy_for_basename(basename, df_raw)
     available_from_calendar = _compute_available_from_calendar(df_raw, policy)
 
@@ -205,11 +235,41 @@ def main() -> None:
     if not csv_paths:
         raise FileNotFoundError(f"No CSV files found in {INPUT_DIR}")
 
+    manifest: dict[str, object] = {
+        "artifact_dir": str(OUTPUT_DIR.as_posix()),
+        "trading_calendar_source": str(spdr_path.as_posix()),
+        "trading_dates_start": str(pd.Timestamp(trading_dates.min()).date()),
+        "trading_dates_end": str(pd.Timestamp(trading_dates.max()).date()),
+        "shift_policy": "All series are shifted by +1 row so Date=T contains info available by Open(T), i.e., Close(T-1) for daily series.",
+        "files": [],
+    }
+
     for csv_path in csv_paths:
         out_path = OUTPUT_DIR / f"{csv_path.stem}.parquet"
         df_out = _build_pit_dataset(csv_path, trading_dates)
         df_out.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path} shape={df_out.shape}")
+
+        df_raw = _read_csv(csv_path)
+        pol = _policy_for_basename(csv_path.stem, df_raw)
+        file_meta = {
+            "basename": csv_path.stem,
+            "input": str(csv_path.as_posix()),
+            "output": str(out_path.as_posix()),
+            "policy": {
+                "kind": pol.kind,
+                "lag_days": int(pol.lag_days),
+                "lag_months": int(pol.lag_months),
+                "ffill_limit": None if pol.ffill_limit is None else int(pol.ffill_limit),
+            },
+            "columns": [c for c in df_out.columns if c != "Date"],
+            "start": str(pd.to_datetime(df_out["Date"].min()).date()) if len(df_out) else None,
+            "end": str(pd.to_datetime(df_out["Date"].max()).date()) if len(df_out) else None,
+        }
+        manifest["files"].append(file_meta)
+
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Wrote manifest: {MANIFEST_PATH}")
 
 
 if __name__ == "__main__":

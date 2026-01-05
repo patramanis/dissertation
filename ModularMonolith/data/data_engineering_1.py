@@ -9,9 +9,8 @@ import pandas as pd
 
 RAW1_DIR = Path("ModularMonolith") / "data" / "raw_data_1"
 RAW2_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
-RAW3_DIR = Path("ModularMonolith") / "data" / "raw_data_3"
 OUT_DIR = Path("ModularMonolith") / "data" / "processed_data_1"
-LABELS_PATH = Path("ModularMonolith") / "data" / "labels" / "labels.parquet"
+LABELS_DIR = Path("ModularMonolith") / "data" / "labels"
 
 SPY_CSV = RAW1_DIR / "SPY.csv"
 SPY_RAW2 = RAW2_DIR / "SPY.parquet"
@@ -30,8 +29,6 @@ class HorizonSpec:
     mdd_window: int
     semi_windows: tuple[int, ...]
     ratio_z_windows: tuple[int, ...]
-    state_sum_windows: tuple[int, ...]
-    state_z_window: int
 
 
 HORIZONS: dict[int, HorizonSpec] = {
@@ -45,8 +42,6 @@ HORIZONS: dict[int, HorizonSpec] = {
         mdd_window=21,
         semi_windows=(5, 21),
         ratio_z_windows=(21, 63),
-        state_sum_windows=(1, 5),
-        state_z_window=21,
     ),
     21: HorizonSpec(
         h=21,
@@ -58,8 +53,6 @@ HORIZONS: dict[int, HorizonSpec] = {
         mdd_window=63,
         semi_windows=(21, 63),
         ratio_z_windows=(63, 126),
-        state_sum_windows=(21, 63),
-        state_z_window=63,
     ),
     63: HorizonSpec(
         h=63,
@@ -71,8 +64,6 @@ HORIZONS: dict[int, HorizonSpec] = {
         mdd_window=252,
         semi_windows=(63, 126),
         ratio_z_windows=(126, 252),
-        state_sum_windows=(63, 126),
-        state_z_window=126,
     ),
 }
 
@@ -236,83 +227,6 @@ def _melt_features(df_wide: pd.DataFrame, prefix: str) -> pd.DataFrame:
     return out
 
 
-def _load_state_variables(trading_dates: pd.DatetimeIndex) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-
-    def add_parquet(name: str, cols: list[str] | None = None) -> None:
-        p = RAW3_DIR / f"{name}.parquet"
-        if not p.exists():
-            return
-        df = _read_parquet(p)
-        df = df.set_index(pd.DatetimeIndex(df["Date"]).tz_localize(None))
-        df = df.drop(columns=["Date"], errors="ignore")
-        df = df.reindex(trading_dates)
-        if cols is not None:
-            keep = [c for c in cols if c in df.columns]
-            df = df[keep]
-        frames.append(df)
-
-    add_parquet(
-        "Futures",
-        cols=[
-            "CL=F_asinh",
-            "CL=F_diff",
-            "GC=F_logret",
-            "HG=F_logret",
-            "DX-Y.NYB_logret",
-            "^IRX_diff",
-            "^TNX_diff",
-            "^VIX_log1p",
-            "^VIX_dlog1p",
-        ],
-    )
-    add_parquet("TLT", cols=["TLT_logret"])
-    add_parquet("BAMLH0A0HYM2", cols=["BAMLH0A0HYM2_diff"])
-    add_parquet("NFCI", cols=["NFCI_asinh", "NFCI_diff"])
-    add_parquet("EPU", cols=["EPU_log1p", "EPU_dlog1p"])
-    add_parquet("GPR", cols=["GPR_log1p", "GPR_dlog1p"])
-    add_parquet("ICSA", cols=["ICSA_log1p", "ICSA_dlog1p"])
-    add_parquet("CPIAUCSL", cols=["CPIAUCSL_mom", "CPIAUCSL_yoy"])
-    add_parquet("INDPRO", cols=["INDPRO_mom", "INDPRO_yoy"])
-    add_parquet("UNRATE", cols=["UNRATE_mom", "UNRATE_yoy"])
-
-    if not frames:
-        return pd.DataFrame(index=trading_dates)
-
-    state = pd.concat(frames, axis=1)
-    state = state.loc[:, ~state.columns.duplicated()]
-    state.index.name = "Date"
-    return state
-
-
-def _state_horizon_features(state: pd.DataFrame, spec: HorizonSpec) -> pd.DataFrame:
-    if state.empty:
-        return state
-
-    df = state.copy()
-    change_cols = [c for c in df.columns if any(str(c).endswith(s) for s in ("_diff", "_logret", "_logdiff", "_dlog1p"))]
-    level_cols = [c for c in df.columns if any(str(c).endswith(s) for s in ("_asinh", "_log1p", "_mom", "_yoy"))]
-
-    feats: list[pd.DataFrame] = []
-
-    base = df[sorted(set(change_cols + level_cols))].copy() if (change_cols or level_cols) else pd.DataFrame(index=df.index)
-    feats.append(base)
-
-    for col in change_cols:
-        s = pd.to_numeric(df[col], errors="coerce")
-        for w in spec.state_sum_windows:
-            feats.append(s.rolling(w, min_periods=w).sum().rename(f"{col}_sum{w}"))
-        feats.append(_rolling_zscore(s, spec.state_z_window).rename(f"{col}_z{spec.state_z_window}"))
-
-    for col in level_cols:
-        s = pd.to_numeric(df[col], errors="coerce")
-        feats.append(_rolling_zscore(s, spec.state_z_window).rename(f"{col}_z{spec.state_z_window}"))
-
-    out = pd.concat(feats, axis=1)
-    out.index.name = "Date"
-    return out
-
-
 def _cross_sectional_ranks(df_long: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     out = df_long.copy()
     for col in feature_cols:
@@ -326,7 +240,6 @@ def build_processed_for_horizon(
     spdr_asof: pd.DataFrame,
     spy_asof: pd.Series,
     labels: pd.DataFrame,
-    state_h: pd.DataFrame,
     spec: HorizonSpec,
 ) -> pd.DataFrame:
     dates = pd.DatetimeIndex(spdr_asof.index)
@@ -337,9 +250,19 @@ def build_processed_for_horizon(
     logret_s = _compute_returns(prices)
     logret_m = _compute_returns(spy_px.to_frame())["SPY"]
 
-    ratio = np.log(prices.div(spy_px, axis=0))
+    logret_1d = logret_s.copy()
+    logret_1d.columns = [f"{c}_logret1d" for c in logret_1d.columns]
+    feats_wide: dict[str, pd.DataFrame] = {"logret_1d": logret_1d}
 
-    feats_wide: dict[str, pd.DataFrame] = {}
+    excess_1d = logret_s.sub(logret_m, axis=0)
+    excess_1d.columns = [f"{c}_excess1d" for c in excess_1d.columns]
+    feats_wide["excess_1d"] = excess_1d
+
+    excess_5d = logret_s.sub(logret_m, axis=0).rolling(5, min_periods=5).sum()
+    excess_5d.columns = [f"{c}_excess5d" for c in excess_5d.columns]
+    feats_wide["excess_5d"] = excess_5d
+
+    ratio = np.log(prices.div(spy_px, axis=0))
 
     ratio_level = ratio.copy()
     ratio_level.columns = [f"{c}_ratio_level" for c in ratio_level.columns]
@@ -422,10 +345,6 @@ def build_processed_for_horizon(
 
     out = lab.merge(feat_long, on=["Date", "Sector"], how="left")
 
-    if not state_h.empty:
-        state_h2 = state_h.reset_index()
-        out = out.merge(state_h2, on="Date", how="left")
-
     rank_candidates = [
         c
         for c in out.columns
@@ -453,9 +372,6 @@ def main() -> None:
     if not spdr2_path.exists():
         raise FileNotFoundError(spdr2_path)
 
-    if not LABELS_PATH.exists():
-        raise FileNotFoundError(f"Missing {LABELS_PATH}; run build_labels.py first")
-
     spdr2 = _read_parquet(spdr2_path)
     spdr2["Date"] = pd.to_datetime(spdr2["Date"]).dt.tz_localize(None)
     spdr_asof = spdr2.set_index("Date")
@@ -467,16 +383,17 @@ def main() -> None:
     trading_dates = pd.DatetimeIndex(spdr_asof.index)
     spy_asof = _load_spy_asof(trading_dates)
 
-    labels = _read_panel_parquet(LABELS_PATH, key_cols=["Date", "Sector"])
-    labels["Date"] = pd.to_datetime(labels["Date"]).dt.tz_localize(None)
-
-    state = _load_state_variables(trading_dates)
-
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for h, spec in HORIZONS.items():
-        state_h = _state_horizon_features(state, spec)
-        df_out = build_processed_for_horizon(spdr_asof, spy_asof, labels, state_h, spec)
+        labels_path = LABELS_DIR / f"h{h}.parquet"
+        if not labels_path.exists():
+            raise FileNotFoundError(f"Missing {labels_path}; run build_labels.py first")
+
+        labels = _read_panel_parquet(labels_path, key_cols=["Date", "Sector"])
+        labels["Date"] = pd.to_datetime(labels["Date"]).dt.tz_localize(None)
+
+        df_out = build_processed_for_horizon(spdr_asof, spy_asof, labels, spec)
         out_path = OUT_DIR / f"features_h{h}.parquet"
         df_out.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path} shape={df_out.shape}")

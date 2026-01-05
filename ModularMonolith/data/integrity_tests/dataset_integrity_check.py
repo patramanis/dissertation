@@ -78,23 +78,24 @@ def _is_multiple_of_step(a: np.ndarray, step: float, tol: float = 1e-9) -> bool:
 
 
 def check_horizon(h: int) -> None:
-    base = Path(__file__).resolve().parent
-    dataset_dir = base / "dataset" / f"h{h}"
+    data_dir = Path(__file__).resolve().parents[1]
+    dataset_dir = data_dir / "dataset" / f"h{h}"
 
     X_path = dataset_dir / "X.parquet"
     keys_path = dataset_dir / "keys.parquet"
-    y_path = dataset_dir / "y.npy"
+    y_gate_path = dataset_dir / "y_gate.npy"
+    y_rank_path = dataset_dir / "y_rank.npy"
     group_path = dataset_dir / "group_sizes.npy"
     meta_path = dataset_dir / "meta.json"
 
-    features_path = base / "processed_data_1" / f"features_h{h}.parquet"
-    labels_path = base / "labels" / f"h{h}.parquet"
+    labels_path = data_dir / "labels" / f"h{h}.parquet"
 
     _print_header(f"Dataset Integrity Check — h={h}")
 
     X = pd.read_parquet(X_path)
     keys = pd.read_parquet(keys_path)
-    y = np.load(y_path)
+    y_gate = np.load(y_gate_path)
+    y_rank = np.load(y_rank_path)
     group_sizes = np.load(group_path)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
@@ -102,12 +103,20 @@ def check_horizon(h: int) -> None:
     keys["Date"] = _normalize_date(keys["Date"]).dt.normalize()
     keys["Sector"] = keys["Sector"].astype("string")
 
-    assert len(X) == len(keys) == len(y), f"len mismatch: X={len(X)} keys={len(keys)} y={len(y)}"
-    assert int(group_sizes.sum()) == len(y), f"sum(group_sizes)={group_sizes.sum()} len(y)={len(y)}"
+    assert len(X) == len(keys) == len(y_gate) == len(
+        y_rank
+    ), f"len mismatch: X={len(X)} keys={len(keys)} y_gate={len(y_gate)} y_rank={len(y_rank)}"
+    assert int(group_sizes.sum()) == len(
+        y_rank
+    ), f"sum(group_sizes)={group_sizes.sum()} len(y_rank)={len(y_rank)}"
 
     print(f"Paths: {dataset_dir}")
-    print(f"X shape: {X.shape} | y len: {len(y)} | #dates: {keys['Date'].nunique()}")
-    print(f"Meta target_col: {meta.get('target_col')}")
+    print(
+        f"X shape: {X.shape} | y_gate len: {len(y_gate)} | y_rank len: {len(y_rank)} | #dates: {keys['Date'].nunique()}"
+    )
+    print(
+        f"Meta target_col: {meta.get('target_col')} | cost_threshold: {meta.get('cost_threshold')} | horizon: {meta.get('horizon')}"
+    )
 
     dup_mask = keys.duplicated(["Date", "Sector"], keep=False)
     dup_count = int(dup_mask.sum())
@@ -148,8 +157,19 @@ def check_horizon(h: int) -> None:
         print(f"Rows in tail block: {len(tail)} (expected {len(last_dates) * len(EXPECTED_SECTORS)})")
         print(f"Non-NaN target rows in last {h} dates: {len(non_nan)}")
         if len(non_nan):
-            print("Sample non-NaNs (should be empty to avoid leakage):")
+            print("WARNING: found non-NaN targets in the last h trading days (unexpected)")
             print(non_nan.head(25).to_string(index=False))
+
+        non_nan_labels = labels[labels[target_col].notna()]
+        if non_nan_labels.empty:
+            print("ERROR: labels contain no non-NaN targets")
+        else:
+            last_label_date = non_nan_labels["Date"].max()
+            last_key_date = keys["Date"].max()
+            print(f"Last non-NaN label date: {last_label_date}")
+            print(f"Last dataset key date: {last_key_date}")
+            if last_key_date > last_label_date:
+                print("ERROR: dataset contains dates beyond last non-NaN label date (leakage risk)")
 
     print("\n[Step 4] Warm-up period check (heavy rolling feature NaNs at start)")
     feature_cols = list(X.columns)

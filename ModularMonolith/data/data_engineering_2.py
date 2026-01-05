@@ -1,12 +1,19 @@
 from __future__ import annotations
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 
-WINDOW = 63
-MIN_PERIODS = 40
+SECTOR_MACRO_WINDOWS: tuple[int, ...] = (21, 63, 126)
+MIN_PERIODS_BY_WINDOW: dict[int, int] = {
+    21: 15,
+    63: 40,
+    126: 80,
+}
+
+MACRO_MACRO_WINDOWS: tuple[int, ...] = (21, 63)
 
 
 def _find_mm_root(start: Path) -> Path:
@@ -77,11 +84,58 @@ def _load_macro(raw_data_3_dir: Path) -> pd.DataFrame:
     return macro
 
 
+def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: str) -> pd.DataFrame:
+    s = pd.to_numeric(s, errors="coerce")
+    tmp = s.rename("value").to_frame()
+    tmp.index = pd.to_datetime(tmp.index, utc=False)
+    tmp.index.name = "Date"
+    tmp = tmp.reset_index()
+    if tmp.empty:
+        return pd.DataFrame(columns=["Date", "Sector", "Feature", "value"])
+
+    dates = tmp["Date"].to_numpy()
+    values = tmp["value"].to_numpy()
+    rep_dates = np.repeat(dates, len(sectors))
+    rep_values = np.repeat(values, len(sectors))
+    rep_sectors = np.tile(np.array(sectors, dtype=object), len(dates))
+
+    out = pd.DataFrame({"Date": rep_dates, "Sector": rep_sectors, "Feature": feature, "value": rep_values})
+    return out[["Date", "Sector", "Feature", "value"]]
+
+
+def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: list[str]) -> list[pd.DataFrame]:
+    drivers: dict[str, str] = {
+        "rates": "^TNX_diff",
+        "oil": "CL=F_diff",
+        "usd": "DX-Y.NYB_logret",
+        "bonds": "TLT_logret",
+    }
+
+    df = macro.copy()
+    df = df.sort_values("Date")
+    df = df.set_index("Date")
+
+    names = sorted(drivers)
+    out: list[pd.DataFrame] = []
+
+    for w in windows:
+        minp = int(MIN_PERIODS_BY_WINDOW.get(int(w), max(2, int(w) // 2)))
+        for i, a in enumerate(names):
+            for b in names[i + 1 :]:
+                sa = pd.to_numeric(df[drivers[a]], errors="coerce")
+                sb = pd.to_numeric(df[drivers[b]], errors="coerce")
+                corr = sa.rolling(window=int(w), min_periods=minp).corr(sb)
+                feat = f"corr_macro_{a}_{b}_{int(w)}"
+                out.append(_broadcast_series_to_sectors(corr, sectors=sectors, feature=feat))
+
+    return out
+
+
 def _rolling_corr_against_drivers(
     sector_logrets: pd.DataFrame,
     macro: pd.DataFrame,
-    window: int = WINDOW,
-    min_periods: int = MIN_PERIODS,
+    window: int,
+    min_periods: int,
 ) -> list[pd.DataFrame]:
     sector_cols = [c for c in sector_logrets.columns if c != "Date"]
     sectors = [c.removesuffix("_logret") for c in sector_cols]
@@ -131,7 +185,10 @@ def _rolling_corr_against_drivers(
 
 def _to_long_feature(df: pd.DataFrame, feature: str) -> pd.DataFrame:
     tmp = df.copy()
-    tmp = tmp.reset_index(names="Date")
+    tmp.index.name = "Date"
+    tmp = tmp.reset_index()
+    if "Date" not in tmp.columns:
+        tmp = tmp.rename(columns={tmp.columns[0]: "Date"})
     out = tmp.melt(id_vars=["Date"], var_name="Sector", value_name="value")
     out["Feature"] = feature
     return out[["Date", "Sector", "Feature", "value"]]
@@ -156,7 +213,15 @@ def main() -> None:
     sector_logrets = _load_spdr_prices(spdr_path)
     macro = _load_macro(raw_data_3_dir)
 
-    long_frames = _rolling_corr_against_drivers(sector_logrets, macro, window=WINDOW, min_periods=MIN_PERIODS)
+    sector_cols = [c for c in sector_logrets.columns if c != "Date"]
+    sectors = [c.removesuffix("_logret") for c in sector_cols]
+
+    long_frames: list[pd.DataFrame] = []
+    for w in SECTOR_MACRO_WINDOWS:
+        minp = int(MIN_PERIODS_BY_WINDOW.get(int(w), max(2, int(w) // 2)))
+        long_frames.extend(_rolling_corr_against_drivers(sector_logrets, macro, window=int(w), min_periods=minp))
+
+    long_frames.extend(_macro_macro_corrs(macro, windows=MACRO_MACRO_WINDOWS, sectors=sectors))
     features_long = pd.concat(long_frames, ignore_index=True)
 
     features_long = features_long.sort_values(["Date", "Sector", "Feature"], kind="mergesort")

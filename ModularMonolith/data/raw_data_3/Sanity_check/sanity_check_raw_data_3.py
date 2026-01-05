@@ -132,7 +132,9 @@ def check_b_inverse_transform_oil(df_fut1: pd.DataFrame, df_fut3: pd.DataFrame) 
     oil_level = pd.to_numeric(df_fut1["CL=F"], errors="coerce").astype("float64")
     level_med = float(oil_level.dropna().median())
 
-    print(f"B) CL=F_asinh median={asinh_med:.4f} -> sinh(median)≈{implied_level:.2f}; raw CL=F median≈{level_med:.2f}")
+    print(
+        f"B) CL=F_asinh median={asinh_med:.4f} -> sinh(median)~={implied_level:.2f}; raw CL=F median~={level_med:.2f}"
+    )
 
 
 def check_c_nonfinite_and_spikes(df_fut1: pd.DataFrame, df_fut3: pd.DataFrame) -> None:
