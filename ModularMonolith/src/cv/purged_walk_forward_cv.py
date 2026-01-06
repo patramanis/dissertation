@@ -83,9 +83,12 @@ class PurgedWalkForwardCV(BaseCrossValidator):
         n_groups = unique_groups.shape[0]
 
         required = self.n_splits * self.test_size + self.purge_gap + self.min_train_size
+        if self.embargo > 0:
+            required += (self.n_splits - 1) * self.embargo
         if n_groups < required:
             raise ValueError(
-                f"Not enough unique groups for n_splits*test_size+purge_gap+min_train_size: "
+                f"Not enough unique groups for n_splits*test_size+purge_gap+min_train_size"
+                f"{' (+conservative cumulative embargo bound)' if self.embargo > 0 else ''}: "
                 f"have {n_groups}, need {required}"
             )
 
@@ -238,12 +241,16 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _mm_root() -> Path:
+    return _repo_root()
+
+
 def _dataset_dir() -> Path:
-    return _repo_root() / "ModularMonolith" / "data" / "dataset"
+    return _mm_root() / "data" / "dataset"
 
 
 def _out_dir() -> Path:
-    return _repo_root() / "ModularMonolith" / "data" / "traintestperiods"
+    return _mm_root() / "data" / "traintestperiods"
 
 
 def _load_groups_from_keys(keys_path: Path) -> np.ndarray:
@@ -259,11 +266,6 @@ def _load_groups_from_keys(keys_path: Path) -> np.ndarray:
 
 
 def _simulate_synthetic_price(dates: np.ndarray, *, seed: int = 123, start: float = 100.0) -> np.ndarray:
-    """Synthetic price series to visualize CV windows.
-
-    Uses a simple geometric random walk so the plotted line looks like a market price.
-    """
-
     rng = np.random.default_rng(seed)
     n = int(len(dates))
     if n <= 0:

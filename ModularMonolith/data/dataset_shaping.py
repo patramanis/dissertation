@@ -46,8 +46,8 @@ DATASET_OUT_DIR: Path = Path(__file__).resolve().parent / "dataset"
 
 
 RAW3_SKIP_DATASETS: tuple[str, ...] = (
-    "SPDR",  # sector raw levels belong in engineered P1 features
-    "SPY",  # raw level belongs nowhere in X; SPY return features handled elsewhere
+    "SPDR",
+    "SPY",
 )
 
 
