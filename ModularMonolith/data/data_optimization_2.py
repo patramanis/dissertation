@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 
 
-RAW1_DIR = Path("ModularMonolith") / "data" / "raw_data_1"
-RAW2_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
-RAW3_DIR = Path("ModularMonolith") / "data" / "raw_data_3"
+MM_ROOT = Path(__file__).resolve().parents[1]
+RAW1_DIR = MM_ROOT / "data" / "raw_data_1"
+RAW2_DIR = MM_ROOT / "data" / "raw_data_2"
+RAW3_DIR = MM_ROOT / "data" / "raw_data_3"
 
 
 MONTHLY_FILES = {"CPIAUCSL", "UNRATE", "INDPRO"}

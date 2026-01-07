@@ -8,8 +8,9 @@ from typing import Callable, Literal
 import pandas as pd
 
 
-INPUT_DIR = Path("ModularMonolith") / "data" / "raw_data_1"
-OUTPUT_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
+MM_ROOT = Path(__file__).resolve().parents[1]
+INPUT_DIR = MM_ROOT / "data" / "raw_data_1"
+OUTPUT_DIR = MM_ROOT / "data" / "raw_data_2"
 
 MANIFEST_PATH = OUTPUT_DIR / "raw_data_2_manifest.json"
 

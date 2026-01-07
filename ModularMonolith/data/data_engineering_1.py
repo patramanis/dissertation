@@ -7,10 +7,11 @@ import numpy as np
 import pandas as pd
 
 
-RAW1_DIR = Path("ModularMonolith") / "data" / "raw_data_1"
-RAW2_DIR = Path("ModularMonolith") / "data" / "raw_data_2"
-OUT_DIR = Path("ModularMonolith") / "data" / "processed_data_1"
-LABELS_DIR = Path("ModularMonolith") / "data" / "labels"
+MM_ROOT = Path(__file__).resolve().parents[1]
+RAW1_DIR = MM_ROOT / "data" / "raw_data_1"
+RAW2_DIR = MM_ROOT / "data" / "raw_data_2"
+OUT_DIR = MM_ROOT / "data" / "processed_data_1"
+LABELS_DIR = MM_ROOT / "data" / "labels"
 
 SPY_CSV = RAW1_DIR / "SPY.csv"
 SPY_RAW2 = RAW2_DIR / "SPY.parquet"

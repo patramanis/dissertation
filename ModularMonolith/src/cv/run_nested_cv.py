@@ -353,6 +353,40 @@ def _drop_small_rank_groups(
     return X.loc[keep.to_numpy()], y.loc[keep.to_numpy()], np.asarray(groups)[keep.to_numpy()]
 
 
+def get_xgboost_group_sizes_from_preordered(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "Date",
+) -> np.ndarray:
+    if group_col not in df.columns:
+        raise ValueError(f"Missing group_col={group_col!r} in df")
+
+    grp = df[group_col]
+    if grp.isna().any():
+        raise ValueError(f"group_col={group_col!r} contains NaNs")
+
+    seen: set[object] = set()
+    prev = object()
+    for v in grp.to_numpy():
+        if v != prev:
+            if v in seen:
+                raise ValueError(
+                    f"Rows are not contiguous by {group_col!r}; do not compute group sizes without aligning order. "
+                    f"Sort X/y/keys first (e.g. by {group_col!r} and any tie-breakers), then call this helper."
+                )
+            seen.add(v)
+            prev = v
+
+    # Group sizes in existing order (no sort).
+    boundaries = grp.ne(grp.shift(1))
+    sizes = boundaries.groupby(grp, sort=False).sum().to_numpy(dtype=np.int32)
+
+    if int(sizes.sum()) != len(df):
+        raise RuntimeError("Group sizes do not sum to number of rows")
+
+    return sizes
+
+
 def _rank_order_and_group_sizes(
     *,
     X: pd.DataFrame,

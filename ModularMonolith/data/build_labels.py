@@ -259,8 +259,11 @@ def main() -> None:
 
     for h in horizons:
         out_h = out_by_h[int(h)]
-        out_path = OUT_DIR / f"{int(h)}d.parquet"
-        out_h.to_parquet(out_path, index=False, engine="pyarrow")
+        # Single canonical format expected by data_engineering_1.py / dataset_shaping.py.
+        # Keep helpful columns (y_gate/rel_rank/metadata) while using horizon-specific target name.
+        out_one = out_h.rename(columns={"label_excess": f"label_excess_{int(h)}d"})
+        out_path = OUT_DIR / f"h{int(h)}.parquet"
+        out_one.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path}")
 
 
