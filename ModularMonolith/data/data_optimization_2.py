@@ -163,8 +163,25 @@ def _build_monthly_growth_features(
         trading_dates,
         available_from_calendar,
     )
+    try:
+        obs_idx = trading_dates.get_indexer(pd.DatetimeIndex(mapped.index))
+        obs_idx = obs_idx[obs_idx >= 0]
+        if obs_idx.size >= 2:
+            max_gap = int(np.diff(obs_idx).max())
+            if policy.ffill_limit is None and max_gap > 63:
+                print(
+                    f"WARNING: {basename} mapped observations have max gap={max_gap} trading days "
+                    "and ffill is currently unbounded (ffill_limit=None)."
+                )
+    except Exception:
+        pass
 
-    out = mapped.reindex(trading_dates).ffill().shift(1)
+    base = mapped.reindex(trading_dates)
+    if policy.ffill_limit is None:
+        out = base.ffill()
+    else:
+        out = base.ffill(limit=int(policy.ffill_limit))
+    out = out.shift(1)
     out_df = out.reset_index().rename(columns={"index": "Date"})
     if "Date" not in out_df.columns:
         out_df = out_df.rename(columns={out_df.columns[0]: "Date"})

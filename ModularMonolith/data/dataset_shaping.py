@@ -8,6 +8,13 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+try:
+    from ModularMonolith import build_id
+
+    BUILD_ID = build_id(__file__)
+except Exception:
+    BUILD_ID = str(Path(__file__).resolve())
+
 
 EXPECTED_SECTORS: tuple[str, ...] = (
     "XLB",
@@ -40,6 +47,54 @@ COST_THRESHOLD: dict[int, float] = {
     21: 0.002,
     63: 0.005,
 }
+
+
+def _resolve_label_excess_column(labels: pd.DataFrame, *, horizon: int) -> str:
+    legacy = f"label_excess_{int(horizon)}d"
+    if "label_excess" in labels.columns:
+        return "label_excess"
+    if legacy in labels.columns:
+        raise ValueError(
+            f"Labels parquet uses legacy horizon-suffixed target column '{legacy}'. "
+            "Regenerate labels so the parquet contains canonical 'label_excess' (and keep horizon in filename/horizon column)."
+        )
+    raise ValueError(
+        "Labels parquet is missing the required canonical target column 'label_excess'. "
+        f"Columns={sorted(map(str, labels.columns))}"
+    )
+
+
+def _maybe_validate_labels_horizon(labels: pd.DataFrame, *, horizon: int, labels_path: Path) -> None:
+    if "horizon" not in labels.columns:
+        return
+    h_unique = pd.to_numeric(labels["horizon"], errors="coerce").dropna().unique()
+    if h_unique.size == 0:
+        return
+    if h_unique.size != 1 or int(h_unique[0]) != int(horizon):
+        raise ValueError(
+            f"Labels horizon mismatch for {labels_path}: expected horizon={int(horizon)}; got unique={h_unique.tolist()}"
+        )
+
+
+def _rel_rank_per_date_from_excess(excess: pd.Series, *, cost: float) -> pd.Series:
+
+    mask = excess.notna()
+    if int(mask.sum()) < 2:
+        return pd.Series(pd.NA, index=excess.index, dtype="Int8")
+
+    valid = pd.to_numeric(excess[mask], errors="coerce").dropna()
+    if valid.empty:
+        return pd.Series(pd.NA, index=excess.index, dtype="Int8")
+
+    q60 = float(valid.quantile(0.60))
+    q80 = float(valid.quantile(0.80))
+
+    rel = pd.Series(pd.NA, index=excess.index, dtype="Int8")
+    rel.loc[mask & (excess <= cost)] = 0
+    rel.loc[mask & (excess > cost) & (excess <= q60)] = 1
+    rel.loc[mask & (excess > q60) & (excess <= q80)] = 2
+    rel.loc[mask & (excess > q80)] = 3
+    return rel
 
 
 DATASET_OUT_DIR: Path = Path(__file__).resolve().parent / "dataset"
@@ -296,7 +351,7 @@ def _build_rank_target(
 
 
 def _select_feature_columns(df: pd.DataFrame, *, target_col: str) -> list[str]:
-    non_feature = {"Date", "Sector", "rank_target", "y_gate"}
+    non_feature = {"Date", "Sector", "rank_target", "y_gate", "rel_rank", "cost_bps", "horizon"}
 
     for c in df.columns:
         if c.startswith("label_"):
@@ -339,7 +394,7 @@ def load_dual_model_dataset(
     if horizon not in HORIZONS:
         raise ValueError(f"Unsupported horizon {horizon}; expected one of {HORIZONS}")
 
-    target_col = f"label_excess_{horizon}d"
+    target_col = "label_excess"
 
     if horizon not in COST_THRESHOLD:
         raise ValueError(f"Missing COST_THRESHOLD for horizon={horizon}; have keys={sorted(COST_THRESHOLD)}")
@@ -368,7 +423,19 @@ def load_dual_model_dataset(
     labels = pd.read_parquet(labels_path)
     features_p1 = pd.read_parquet(features_path)
 
-    labels = labels[["Date", "Sector", target_col]].copy()
+    _maybe_validate_labels_horizon(labels, horizon=horizon, labels_path=labels_path)
+    label_excess_col = _resolve_label_excess_column(labels, horizon=horizon)
+    target_col = label_excess_col
+
+    keep_label_cols = ["Date", "Sector", label_excess_col]
+    for extra in ("y_gate", "rel_rank", "cost_bps", "horizon"):
+        if extra in labels.columns:
+            keep_label_cols.append(extra)
+
+    labels = labels[keep_label_cols].copy()
+    if label_excess_col != "label_excess":
+        labels = labels.rename(columns={label_excess_col: "label_excess"})
+        target_col = "label_excess"
 
     correlations_wide = _load_correlations_wide(correlations_path)
     macro = _load_raw3_macro_broadcast(raw3_dir)
@@ -461,7 +528,18 @@ def load_dual_model_dataset(
 
     merged = merged.sort_values(["Date", "Sector"], kind="mergesort").reset_index(drop=True)
 
-    merged["y_gate"] = (merged[target_col] > cost_threshold).astype(np.int8)
+    if "y_gate" not in merged.columns:
+        merged["y_gate"] = (merged[target_col] > cost_threshold).astype(np.int8)
+    else:
+        merged["y_gate"] = pd.to_numeric(merged["y_gate"], errors="coerce").astype("Int64").astype(np.int8)
+
+    if "rel_rank" not in merged.columns:
+        merged["rel_rank"] = (
+            merged.groupby("Date", sort=False)[target_col]
+            .apply(lambda s: _rel_rank_per_date_from_excess(s, cost=cost_threshold))
+            .reset_index(level=0, drop=True)
+            .astype("Int8")
+        )
 
     rt = _build_rank_target(merged, target_col=target_col, n_expected=len(EXPECTED_SECTORS))
     merged = merged.merge(rt.rename("rank_target"), on=["Date", "Sector"], how="left", validate="one_to_one")
@@ -548,6 +626,7 @@ def _save_shaping_result(res: ShapingResult, *, out_root: Path = DATASET_OUT_DIR
     X_path = out_dir / "X.parquet"
     y_gate_path = out_dir / "y_gate.npy"
     y_rank_path = out_dir / "y_rank.npy"
+    y_path = out_dir / "y.parquet"
     group_path = out_dir / "group_sizes.npy"
     keys_path = out_dir / "keys.parquet"
     meta_path = out_dir / "meta.json"
@@ -558,6 +637,12 @@ def _save_shaping_result(res: ShapingResult, *, out_root: Path = DATASET_OUT_DIR
     np.save(group_path, res.group_sizes)
     keys.to_parquet(keys_path, index=False, engine="pyarrow")
 
+    y_df = res.full_df[["Date", "Sector"]].copy()
+    for c in ("label_excess", "y_gate", "rel_rank", "rank_target", "cost_bps", "horizon"):
+        if c in res.full_df.columns:
+            y_df[c] = res.full_df[c].to_numpy()
+    y_df.to_parquet(y_path, index=False, engine="pyarrow")
+
     meta = {
         "horizon": int(res.horizon),
         "target_col": res.target_col,
@@ -565,6 +650,11 @@ def _save_shaping_result(res: ShapingResult, *, out_root: Path = DATASET_OUT_DIR
         "n_rows": int(len(res.y_rank)),
         "n_dates": int(res.full_df["Date"].nunique()),
         "n_features": int(res.X.shape[1]),
+        "y_artifacts": {
+            "y_gate": "y_gate.npy",
+            "y_rank": "y_rank.npy",
+            "y": "y.parquet",
+        },
         "expected_sectors": list(EXPECTED_SECTORS),
         "dropped_rows_nan_target": int(res.dropped_rows_nan_target),
         "dropped_dates_nan_target": int(res.dropped_dates_nan_target),
@@ -579,6 +669,7 @@ def _save_shaping_result(res: ShapingResult, *, out_root: Path = DATASET_OUT_DIR
         y_rank2 = np.load(y_rank_path)
         gs2 = np.load(group_path)
         keys2 = pd.read_parquet(keys_path)
+        _ = pd.read_parquet(y_path)
 
         if len(X2) != len(y_gate2) or len(X2) != len(y_rank2) or len(X2) != len(keys2):
             raise RuntimeError(
@@ -621,4 +712,5 @@ def run_all_horizons(*, enforce_full_universe: bool = True, save_outputs: bool =
 
 
 if __name__ == "__main__":
+    print(f"[dataset_shaping] BUILD_ID={BUILD_ID}")
     run_all_horizons(enforce_full_universe=True, save_outputs=True)

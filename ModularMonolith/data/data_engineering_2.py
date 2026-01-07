@@ -61,7 +61,7 @@ def _load_spdr_prices(spdr_path: Path) -> pd.DataFrame:
     return out
 
 
-def _load_macro(raw_data_3_dir: Path) -> pd.DataFrame:
+def _load_macro(raw_data_3_dir: Path, *, strict: bool = True) -> pd.DataFrame:
     futures_path = raw_data_3_dir / "Futures.parquet"
     tlt_path = raw_data_3_dir / "TLT.parquet"
 
@@ -69,12 +69,28 @@ def _load_macro(raw_data_3_dir: Path) -> pd.DataFrame:
     _require_file(tlt_path)
 
     futures = pd.read_parquet(futures_path)
-    _require_columns(futures, futures_path, ["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"])
-    futures = futures[["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"]].copy()
+    if strict:
+        _require_columns(futures, futures_path, ["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"])
+        futures = futures[["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"]].copy()
+    else:
+        _require_columns(futures, futures_path, ["Date"])
+        wanted = ["^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"]
+        keep = [c for c in wanted if c in futures.columns]
+        missing = [c for c in wanted if c not in futures.columns]
+        if missing:
+            print(f"WARNING: Futures.parquet missing driver columns: {missing}. Proceeding with available={keep}")
+        futures = futures[["Date", *keep]].copy()
 
     tlt = pd.read_parquet(tlt_path)
-    _require_columns(tlt, tlt_path, ["Date", "TLT_logret"])
-    tlt = tlt[["Date", "TLT_logret"]].copy()
+    if strict:
+        _require_columns(tlt, tlt_path, ["Date", "TLT_logret"])
+        tlt = tlt[["Date", "TLT_logret"]].copy()
+    else:
+        _require_columns(tlt, tlt_path, ["Date"])
+        keep = [c for c in ["TLT_logret"] if c in tlt.columns]
+        if not keep:
+            print("WARNING: TLT.parquet missing 'TLT_logret'. Proceeding without bonds driver.")
+        tlt = tlt[["Date", *keep]].copy()
 
     for df in (futures, tlt):
         df["Date"] = pd.to_datetime(df["Date"], utc=False)
@@ -101,7 +117,6 @@ def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: s
 
     out = pd.DataFrame({"Date": rep_dates, "Sector": rep_sectors, "Feature": feature, "value": rep_values})
     return out[["Date", "Sector", "Feature", "value"]]
-
 
 def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: list[str]) -> list[pd.DataFrame]:
     drivers: dict[str, str] = {
@@ -136,8 +151,16 @@ def _rolling_corr_against_drivers(
     macro: pd.DataFrame,
     window: int,
     min_periods: int,
+    *,
+    skip_missing_drivers: bool = False,
 ) -> list[pd.DataFrame]:
     sector_cols = [c for c in sector_logrets.columns if c != "Date"]
+    bad_suffix = [c for c in sector_cols if not str(c).endswith("_logret")]
+    if bad_suffix:
+        raise ValueError(
+            "Sector return columns must end with '_logret' to derive sector names safely. "
+            f"Bad columns: {bad_suffix}"
+        )
     sectors = [c.removesuffix("_logret") for c in sector_cols]
 
     df = sector_logrets.merge(macro, on="Date", how="left")
@@ -154,6 +177,16 @@ def _rolling_corr_against_drivers(
     long_frames: list[pd.DataFrame] = []
 
     for driver_name, driver_col in drivers.items():
+        if driver_col not in df.columns:
+            msg = (
+                f"Missing macro driver column '{driver_col}' needed for '{driver_name}' correlations. "
+                f"Available macro columns={sorted([c for c in df.columns if c != 'Date'])}"
+            )
+            if skip_missing_drivers:
+                print(f"WARNING: {msg}. Skipping.")
+                continue
+            raise KeyError(msg)
+
         driver = df.set_index("Date")[driver_col]
 
         corr_df = sector_ret.rolling(window=window, min_periods=min_periods).corr(driver)
@@ -211,7 +244,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sector_logrets = _load_spdr_prices(spdr_path)
-    macro = _load_macro(raw_data_3_dir)
+    macro = _load_macro(raw_data_3_dir, strict=True)
 
     sector_cols = [c for c in sector_logrets.columns if c != "Date"]
     sectors = [c.removesuffix("_logret") for c in sector_cols]
@@ -219,7 +252,15 @@ def main() -> None:
     long_frames: list[pd.DataFrame] = []
     for w in SECTOR_MACRO_WINDOWS:
         minp = int(MIN_PERIODS_BY_WINDOW.get(int(w), max(2, int(w) // 2)))
-        long_frames.extend(_rolling_corr_against_drivers(sector_logrets, macro, window=int(w), min_periods=minp))
+        long_frames.extend(
+            _rolling_corr_against_drivers(
+                sector_logrets,
+                macro,
+                window=int(w),
+                min_periods=minp,
+                skip_missing_drivers=False,
+            )
+        )
 
     long_frames.extend(_macro_macro_corrs(macro, windows=MACRO_MACRO_WINDOWS, sectors=sectors))
     features_long = pd.concat(long_frames, ignore_index=True)

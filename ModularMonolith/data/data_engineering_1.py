@@ -6,12 +6,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from ModularMonolith import build_id
+
+    BUILD_ID = build_id(__file__)
+except Exception:
+    BUILD_ID = str(Path(__file__).resolve())
+
 
 MM_ROOT = Path(__file__).resolve().parents[1]
 RAW1_DIR = MM_ROOT / "data" / "raw_data_1"
 RAW2_DIR = MM_ROOT / "data" / "raw_data_2"
 OUT_DIR = MM_ROOT / "data" / "processed_data_1"
-LABELS_DIR = MM_ROOT / "data" / "labels"
 
 SPY_CSV = RAW1_DIR / "SPY.csv"
 SPY_RAW2 = RAW2_DIR / "SPY.parquet"
@@ -194,17 +200,23 @@ def _compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def _beta_and_corr(r_s: pd.DataFrame, r_m: pd.Series, window: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    eps = 1e-12
     m_s = r_s.rolling(window, min_periods=window).mean()
     m_m = r_m.rolling(window, min_periods=window).mean()
 
     cov = (r_s.mul(r_m, axis=0)).rolling(window, min_periods=window).mean() - m_s.mul(m_m, axis=0)
     var_m = r_m.rolling(window, min_periods=window).var(ddof=0)
 
+    var_m = var_m.mask(var_m.abs() < eps)
+
     beta = cov.div(var_m, axis=0)
 
     std_s = r_s.rolling(window, min_periods=window).std(ddof=0)
     std_m = r_m.rolling(window, min_periods=window).std(ddof=0)
-    corr = cov.div(std_s.mul(std_m, axis=0))
+
+    denom = std_s.mul(std_m, axis=0)
+    denom = denom.mask(denom.abs() < eps)
+    corr = cov.div(denom)
 
     return beta, corr
 
@@ -240,7 +252,6 @@ def _cross_sectional_ranks(df_long: pd.DataFrame, feature_cols: list[str]) -> pd
 def build_processed_for_horizon(
     spdr_asof: pd.DataFrame,
     spy_asof: pd.Series,
-    labels: pd.DataFrame,
     spec: HorizonSpec,
 ) -> pd.DataFrame:
     dates = pd.DatetimeIndex(spdr_asof.index)
@@ -341,10 +352,7 @@ def build_processed_for_horizon(
     feat_long = feat_long.pivot_table(index=["Date", "Sector"], columns="Feature", values="value", aggfunc="last")
     feat_long = feat_long.reset_index()
 
-    label_col = f"label_excess_{spec.h}d"
-    lab = labels[["Date", "Sector", label_col]].copy()
-
-    out = lab.merge(feat_long, on=["Date", "Sector"], how="left")
+    out = feat_long
 
     rank_candidates = [
         c
@@ -369,6 +377,7 @@ def build_processed_for_horizon(
 
 
 def main() -> None:
+    print(f"[data_engineering_1] BUILD_ID={BUILD_ID}")
     spdr2_path = RAW2_DIR / "SPDR.parquet"
     if not spdr2_path.exists():
         raise FileNotFoundError(spdr2_path)
@@ -387,14 +396,7 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for h, spec in HORIZONS.items():
-        labels_path = LABELS_DIR / f"h{h}.parquet"
-        if not labels_path.exists():
-            raise FileNotFoundError(f"Missing {labels_path}; run build_labels.py first")
-
-        labels = _read_panel_parquet(labels_path, key_cols=["Date", "Sector"])
-        labels["Date"] = pd.to_datetime(labels["Date"]).dt.tz_localize(None)
-
-        df_out = build_processed_for_horizon(spdr_asof, spy_asof, labels, spec)
+        df_out = build_processed_for_horizon(spdr_asof, spy_asof, spec)
         out_path = OUT_DIR / f"features_h{h}.parquet"
         df_out.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path} shape={df_out.shape}")

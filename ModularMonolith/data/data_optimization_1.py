@@ -7,6 +7,13 @@ from typing import Callable, Literal
 
 import pandas as pd
 
+try:
+    from ModularMonolith import build_id
+
+    BUILD_ID = build_id(__file__)
+except Exception:
+    BUILD_ID = str(Path(__file__).resolve())
+
 
 MM_ROOT = Path(__file__).resolve().parents[1]
 INPUT_DIR = MM_ROOT / "data" / "raw_data_1"
@@ -87,14 +94,10 @@ def _floor_to_weekday(dates: pd.Series, target_weekday: int) -> pd.Series:
 def _policy_for_basename(basename: str, df: pd.DataFrame) -> Policy:
     if basename in DAILY_FILES:
         return Policy(kind="daily", lag_days=0, ffill_limit=5)
-
-    # Weekly releases
     if basename == "ICSA":
         return Policy(kind="weekly", lag_days=7, ref_floor=lambda s: _floor_to_weekday(s, 5), ffill_limit=None)
     if basename == "NFCI":
         return Policy(kind="weekly", lag_days=7, ref_floor=lambda s: _floor_to_weekday(s, 4), ffill_limit=None)
-
-    # Monthly macro
     if basename == "UNRATE":
         return Policy(kind="monthly", lag_months=1, lag_days=10, ffill_limit=None)
     if basename in {"CPIAUCSL", "INDPRO"}:
@@ -224,6 +227,7 @@ def _build_pit_dataset(csv_path: Path, trading_dates: pd.DatetimeIndex) -> pd.Da
 
 
 def main() -> None:
+    print(f"[data_optimization_1] BUILD_ID={BUILD_ID}")
     spdr_path = INPUT_DIR / "SPDR.csv"
     if not spdr_path.exists():
         raise FileNotFoundError(f"Missing trading calendar source: {spdr_path}")

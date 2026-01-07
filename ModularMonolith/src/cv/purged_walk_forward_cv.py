@@ -12,7 +12,6 @@ try:
 except Exception as e:
     raise ImportError("scikit-learn error.") from e
 
-
 @dataclass(frozen=True)
 class FoldInfo:
     split_index: int
@@ -152,12 +151,12 @@ class PurgedWalkForwardCV(BaseCrossValidator):
 
             yield train_index, test_index, info
 
-    def split(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray]]:  # noqa: N803
+    def split(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         groups_1d = self._as_1d_array(groups)
         for train_index, test_index, _ in self._iter_splits(groups_1d, want_info=False):
             yield train_index, test_index
 
-    def split_with_info(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray, FoldInfo]]:  # noqa: N803
+    def split_with_info(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray, FoldInfo]]:
         groups_1d = self._as_1d_array(groups)
         for train_index, test_index, info in self._iter_splits(groups_1d, want_info=True):
             if info is None:

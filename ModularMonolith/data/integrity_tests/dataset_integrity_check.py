@@ -7,6 +7,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from ModularMonolith import build_id
+
+    BUILD_ID = build_id(__file__)
+except Exception:
+    BUILD_ID = str(Path(__file__).resolve())
+
 
 EXPECTED_SECTORS: tuple[str, ...] = (
     "XLB",
@@ -140,36 +147,54 @@ def check_horizon(h: int) -> None:
             print("WARNING: stored group_sizes do not match recomputed counts")
 
     print("\n[Step 3] Target horizon check (end-of-sample NaNs)")
-    target_col = f"label_excess_{h}d"
     labels = pd.read_parquet(labels_path)
-    if "Date" not in labels.columns or "Sector" not in labels.columns or target_col not in labels.columns:
-        print(f"ERROR: labels parquet missing required columns: Date/Sector/{target_col}")
+    if "Date" not in labels.columns or "Sector" not in labels.columns:
+        print("ERROR: labels parquet missing required columns: Date/Sector")
     else:
         labels = labels.copy()
         labels["Date"] = _normalize_date(labels["Date"]).dt.normalize()
         labels["Sector"] = labels["Sector"].astype("string")
         labels = labels.sort_values(["Date", "Sector"]).reset_index(drop=True)
 
-        last_dates = labels["Date"].drop_duplicates().sort_values().tail(h).tolist()
-        tail = labels[labels["Date"].isin(last_dates)][["Date", "Sector", target_col]]
-        non_nan = tail[tail[target_col].notna()]
-        print(f"Last {h} trading dates in labels: {len(last_dates)}")
-        print(f"Rows in tail block: {len(tail)} (expected {len(last_dates) * len(EXPECTED_SECTORS)})")
-        print(f"Non-NaN target rows in last {h} dates: {len(non_nan)}")
-        if len(non_nan):
-            print("WARNING: found non-NaN targets in the last h trading days (unexpected)")
-            print(non_nan.head(25).to_string(index=False))
-
-        non_nan_labels = labels[labels[target_col].notna()]
-        if non_nan_labels.empty:
-            print("ERROR: labels contain no non-NaN targets")
+        if "label_excess" in labels.columns:
+            target_col = "label_excess"
         else:
-            last_label_date = non_nan_labels["Date"].max()
-            last_key_date = keys["Date"].max()
-            print(f"Last non-NaN label date: {last_label_date}")
-            print(f"Last dataset key date: {last_key_date}")
-            if last_key_date > last_label_date:
-                print("ERROR: dataset contains dates beyond last non-NaN label date (leakage risk)")
+            legacy_col = f"label_excess_{h}d"
+            if legacy_col in labels.columns:
+                print(
+                    f"ERROR: labels parquet uses legacy target column '{legacy_col}'. "
+                    "Regenerate labels to write canonical 'label_excess' (horizon should be in filename/horizon column)."
+                )
+            else:
+                print("ERROR: labels parquet missing required target column: 'label_excess'")
+            target_col = None
+
+        if "horizon" in labels.columns:
+            h_unique = pd.to_numeric(labels["horizon"], errors="coerce").dropna().unique()
+            if h_unique.size and (h_unique.size != 1 or int(h_unique[0]) != int(h)):
+                print(f"ERROR: labels horizon mismatch: expected {h}, got unique={h_unique.tolist()}")
+
+        if target_col is not None:
+            last_dates = labels["Date"].drop_duplicates().sort_values().tail(h).tolist()
+            tail = labels[labels["Date"].isin(last_dates)][["Date", "Sector", target_col]]
+            non_nan = tail[tail[target_col].notna()]
+            print(f"Last {h} trading dates in labels: {len(last_dates)}")
+            print(f"Rows in tail block: {len(tail)} (expected {len(last_dates) * len(EXPECTED_SECTORS)})")
+            print(f"Non-NaN target rows in last {h} dates: {len(non_nan)}")
+            if len(non_nan):
+                print("WARNING: found non-NaN targets in the last h trading days (unexpected)")
+                print(non_nan.head(25).to_string(index=False))
+
+            non_nan_labels = labels[labels[target_col].notna()]
+            if non_nan_labels.empty:
+                print("ERROR: labels contain no non-NaN targets")
+            else:
+                last_label_date = non_nan_labels["Date"].max()
+                last_key_date = keys["Date"].max()
+                print(f"Last non-NaN label date: {last_label_date}")
+                print(f"Last dataset key date: {last_key_date}")
+                if last_key_date > last_label_date:
+                    print("ERROR: dataset contains dates beyond last non-NaN label date (leakage risk)")
 
     print("\n[Step 4] Warm-up period check (heavy rolling feature NaNs at start)")
     feature_cols = list(X.columns)
@@ -242,6 +267,7 @@ def check_horizon(h: int) -> None:
 
 
 def main() -> None:
+    print(f"[dataset_integrity_check] BUILD_ID={BUILD_ID}")
     for h in HORIZONS:
         check_horizon(h)
 

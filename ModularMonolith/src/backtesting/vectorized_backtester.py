@@ -34,6 +34,7 @@ class VectorizedBacktester:
         *,
         top_k: int = 3,
         holding_period: int = 1,
+        cost_bps: float = 0.0,
     ) -> BacktestResult:
         if not isinstance(predictions, pd.DataFrame):
             raise TypeError("predictions must be a pandas DataFrame")
@@ -41,6 +42,8 @@ class VectorizedBacktester:
             raise ValueError("top_k must be positive")
         if holding_period <= 0:
             raise ValueError("holding_period must be positive")
+        if cost_bps < 0:
+            raise ValueError("cost_bps must be >= 0")
 
         common_cols = [c for c in predictions.columns if c in self.returns_df.columns]
         if not common_cols:
@@ -64,7 +67,9 @@ class VectorizedBacktester:
         scores[scores_nan] = -np.inf
 
         weights = np.zeros_like(scores, dtype=float)
-        top_idx = np.argsort(scores, axis=1)[:, ::-1][:, :k]
+        # Deterministic top-k selection: stable sort on -scores,
+        # with implicit tie-break by column order (after preds.sort_index(axis=1)).
+        top_idx = np.argsort(-scores, axis=1, kind="stable")[:, :k]
         row_idx = np.arange(scores.shape[0])[:, None]
 
         selected_is_finite = np.isfinite(scores[row_idx, top_idx])
@@ -76,10 +81,24 @@ class VectorizedBacktester:
         weights[row_idx, top_idx] = selected_is_finite * per_row_w[:, None]
         weights_df = pd.DataFrame(weights, index=preds.index, columns=preds.columns)
         exec_w = weights_df.shift(holding_period)
+
+        # Gross returns (before costs)
         strat = (exec_w * rets).sum(axis=1, min_count=1)
-        strat_clean = strat.dropna()
+
+        # Simple turnover-based transaction cost model.
+        # Note: this assumes rebalancing each period in `preds` frequency.
+        turnover = exec_w.diff().abs().sum(axis=1).fillna(0.0) / 2.0
+        cost = turnover * (float(cost_bps) / 10_000.0)
+
+        strat_net = strat - cost
+        strat_clean = strat_net.dropna()
         equity = (1.0 + strat_clean).cumprod()
         metrics = self.calculate_metrics(strat_clean)
+
+        if len(strat_clean) > 0:
+            metrics = dict(metrics)
+            metrics["Avg Turnover"] = float(pd.to_numeric(turnover.loc[strat_clean.index], errors="coerce").mean())
+            metrics["Cost (bps)"] = float(cost_bps)
 
         return BacktestResult(
             strategy_returns=strat_clean,

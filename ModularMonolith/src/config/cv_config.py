@@ -16,9 +16,12 @@ def get_cv_config(horizon: int) -> dict[str, Any]:
         n_splits = 20
         test_size = 63
 
+    min_train_size = 252
+
     return {
         "n_splits": n_splits,
         "test_size": test_size,
         "purge_gap": h,
+        "min_train_size": min_train_size,
         "embargo": embargo_map[h],
     }

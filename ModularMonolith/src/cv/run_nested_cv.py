@@ -25,7 +25,7 @@ class NestedCVConfig:
     inner_params: dict[str, Any]
     seeds: list[int]
 
-    task: Literal["excess_regression", "gate_classifier", "ranker"] = "excess_regression"
+    task: Literal["gate_classifier", "ranker"] = "ranker"
 
     feature_selection: Literal["importance", "corr"] = "importance"
 
@@ -70,13 +70,19 @@ def _mask_valid_labels(y: pd.DataFrame) -> np.ndarray:
 
 
 def _mask_valid_target(y: pd.DataFrame, *, task: str) -> np.ndarray:
-    if task == "excess_regression":
-        return y["label_excess"].notna().to_numpy()
     if task == "gate_classifier":
         if "y_gate" not in y.columns:
             raise ValueError("y must contain y_gate for gate_classifier")
         return y["y_gate"].notna().to_numpy()
     if task == "ranker":
+        if "rel_rank" in y.columns:
+            mask = y["rel_rank"].notna()
+            if "label_excess" in y.columns:
+                mask = mask & y["label_excess"].notna()
+            return mask.to_numpy()
+
+        if "label_excess" not in y.columns:
+            raise ValueError("y must contain rel_rank or label_excess for ranker")
         return y["label_excess"].notna().to_numpy()
     raise ValueError(f"Unknown task: {task}")
 
@@ -211,7 +217,7 @@ def tune_hyperparameters(
 
     seed0 = int(config.seeds[0]) if config.seeds else 0
     sampler = optuna.samplers.TPESampler(seed=seed0)
-    direction = "minimize" if config.task == "excess_regression" else "maximize"
+    direction = "maximize"
     study = optuna.create_study(direction=direction, sampler=sampler)
 
     def objective(trial: Any) -> float:
@@ -246,17 +252,7 @@ def tune_hyperparameters(
                 continue
 
             model = model_factory(seed0, dict(params))
-            if config.task == "excess_regression":
-                model = fit_fn(model, X_i_tr, y_i_tr["label_excess"], groups=g_i_tr)
-                pred = np.asarray(predict_fn(model, X_i_va), dtype=float)
-                yt = pd.to_numeric(y_i_va["label_excess"], errors="coerce").to_numpy(dtype=float)
-                ok = np.isfinite(pred) & np.isfinite(yt)
-                if not ok.any():
-                    continue
-                rmse = float(np.sqrt(np.mean((pred[ok] - yt[ok]) ** 2)))
-                scores.append(rmse)
-
-            elif config.task == "gate_classifier":
+            if config.task == "gate_classifier":
                 model = fit_fn(model, X_i_tr, y_i_tr["y_gate"], groups=g_i_tr)
                 pred = np.asarray(predict_fn(model, X_i_va), dtype=float)
                 yt = pd.to_numeric(y_i_va["y_gate"], errors="coerce").to_numpy(dtype=float)
@@ -288,7 +284,7 @@ def tune_hyperparameters(
                 raise ValueError(f"Unknown task: {config.task}")
 
         if not scores:
-            return 1e9 if direction == "minimize" else -1e9
+            return -1e9
 
         return float(np.mean(scores))
 
@@ -377,9 +373,7 @@ def get_xgboost_group_sizes_from_preordered(
             seen.add(v)
             prev = v
 
-    # Group sizes in existing order (no sort).
-    boundaries = grp.ne(grp.shift(1))
-    sizes = boundaries.groupby(grp, sort=False).sum().to_numpy(dtype=np.int32)
+    sizes = grp.groupby(grp, sort=False).size().to_numpy(dtype=np.int32)
 
     if int(sizes.sum()) != len(df):
         raise RuntimeError("Group sizes do not sum to number of rows")
@@ -406,7 +400,7 @@ def _rank_order_and_group_sizes(
     if not sort_cols:
         sort_cols = ["_g"]
 
-    order = df_keys.sort_values(sort_cols).index
+    order = df_keys.sort_values(sort_cols, kind="mergesort").index
     Xs = X.loc[order]
     ys = y.loc[order]
     groups_ser = pd.Series(groups, index=X.index)
@@ -423,7 +417,7 @@ def _rank_order_and_group_sizes(
 def _corr_stable_feature_selection(
     *,
     X: pd.DataFrame,
-    y_excess: pd.Series,
+    y_signal: pd.Series,
     inner_cv: BaseCrossValidator,
     groups: np.ndarray,
     top_n: int,
@@ -435,9 +429,9 @@ def _corr_stable_feature_selection(
 
     counts = pd.Series(0, index=features, dtype=int)
 
-    for inner_train_idx, _inner_val_idx in inner_cv.split(X, y_excess, groups=groups):
+    for inner_train_idx, _inner_val_idx in inner_cv.split(X, y_signal, groups=groups):
         Xi = X.iloc[_as_numpy_index(inner_train_idx)]
-        yi = y_excess.iloc[_as_numpy_index(inner_train_idx)]
+        yi = y_signal.iloc[_as_numpy_index(inner_train_idx)]
 
         ok = yi.notna()
         if int(ok.sum()) < 2:
@@ -499,9 +493,7 @@ def _importance_stability_selection(
             continue
 
         model = model_factory(seed0, dict(base_params))
-        if config.task == "excess_regression":
-            model = fit_fn(model, X_i_tr, y_i_tr["label_excess"], groups=g_i_tr)
-        elif config.task == "gate_classifier":
+        if config.task == "gate_classifier":
             model = fit_fn(model, X_i_tr, y_i_tr["y_gate"], groups=g_i_tr)
         elif config.task == "ranker":
             Xs, ys, _gs, group_sizes = _rank_order_and_group_sizes(X=X_i_tr, y=y_i_tr, groups=g_i_tr)
@@ -531,12 +523,9 @@ def _importance_stability_selection(
     if selected.empty:
         selected = counts
 
-    order = (
-        pd.DataFrame({"count": selected, "mean_imp": mean_imp.loc[selected.index]})
-        .sort_values(["count", "mean_imp", "index"], ascending=[False, False, True])
-        .index
-        .tolist()
-    )
+    tmp = pd.DataFrame({"count": selected, "mean_imp": mean_imp.loc[selected.index]})
+    tmp["feature"] = tmp.index.astype(str)
+    order = tmp.sort_values(["count", "mean_imp", "feature"], ascending=[False, False, True]).index.tolist()
     return order[: int(top_n)]
 
 
@@ -556,10 +545,20 @@ def run_inner_search(
     base_params, _space = _split_fixed_and_search_params(config.inner_params)
 
     if config.feature_selection == "corr":
-        y_excess = y_tr["label_excess"]
+        if config.task == "gate_classifier":
+            y_signal = y_tr["y_gate"]
+        elif config.task == "ranker":
+            if "label_excess" in y_tr.columns:
+                y_signal = y_tr["label_excess"]
+            elif "rel_rank" in y_tr.columns:
+                y_signal = pd.to_numeric(y_tr["rel_rank"], errors="coerce")
+            else:
+                raise ValueError("y_tr must contain label_excess or rel_rank for ranker corr feature selection")
+        else:
+            raise ValueError(f"Unknown task: {config.task}")
         chosen_features = _corr_stable_feature_selection(
             X=X_tr,
-            y_excess=y_excess,
+            y_signal=y_signal,
             inner_cv=inner_cv,
             groups=g_tr,
             top_n=config.top_n_features,
@@ -725,6 +724,8 @@ def run_outer_folds(
 
         thresholds_fold: dict[str, float] = {}
         if config.task == "ranker":
+            if "label_excess" not in y_tr.columns:
+                raise ValueError("ranker task requires label_excess in y for fold-specific thresholds")
             cost = float(config.cost_bps) / 10_000.0
             q60_v, q80_v = _compute_rank_thresholds_from_train(label_excess_train=y_tr["label_excess"], cost=cost)
             y_tr = y_tr.copy()
@@ -778,9 +779,7 @@ def run_outer_folds(
         for seed in config.seeds:
             model = model_factory(int(seed), dict(chosen_params))
 
-            if config.task == "excess_regression":
-                model = fit_fn(model, X_tr[feats], y_tr["label_excess"], groups=g_tr)
-            elif config.task == "gate_classifier":
+            if config.task == "gate_classifier":
                 model = fit_fn(model, X_tr[feats], y_tr["y_gate"], groups=g_tr)
             elif config.task == "ranker":
                 Xs, ys, _gs, group_sizes = _rank_order_and_group_sizes(X=X_tr[feats], y=y_tr, groups=g_tr)
@@ -811,7 +810,9 @@ def run_outer_folds(
                     "fold_id": int(fold_id),
                     "pred_mean": pred_mean,
                     "pred_std": pred_std,
-                    "label_excess": yst["label_excess"].to_numpy(),
+                    "label_excess": (
+                        yst["label_excess"].to_numpy() if "label_excess" in yst.columns else np.full(len(pred_mean), np.nan)
+                    ),
                     "group": gst,
                 }
             )
@@ -826,7 +827,9 @@ def run_outer_folds(
                     "fold_id": int(fold_id),
                     "pred_mean": pred_mean,
                     "pred_std": pred_std,
-                    "label_excess": y_te["label_excess"].to_numpy(),
+                    "label_excess": (
+                        y_te["label_excess"].to_numpy() if "label_excess" in y_te.columns else np.full(len(pred_mean), np.nan)
+                    ),
                     "group": g_te,
                 }
             )

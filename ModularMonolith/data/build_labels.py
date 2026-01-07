@@ -5,6 +5,13 @@ from pathlib import Path
 
 import pandas as pd
 
+try:
+    from ModularMonolith import build_id
+
+    BUILD_ID = build_id(__file__)
+except Exception:
+    BUILD_ID = str(Path(__file__).resolve())
+
 
 LABELS_DIR = Path(__file__).resolve().parent
 DATA_DIR = LABELS_DIR
@@ -201,6 +208,8 @@ def main() -> None:
     parser.add_argument("--cost-bps", type=float, default=10.0, help="Cost threshold in bps for y_gate (default: 10).")
     args = parser.parse_args()
 
+    print(f"[build_labels] BUILD_ID={BUILD_ID}")
+
     for p in (SPDR_PARQUET, SPY_PARQUET):
         if not p.exists():
             raise FileNotFoundError(p)
@@ -259,9 +268,7 @@ def main() -> None:
 
     for h in horizons:
         out_h = out_by_h[int(h)]
-        # Single canonical format expected by data_engineering_1.py / dataset_shaping.py.
-        # Keep helpful columns (y_gate/rel_rank/metadata) while using horizon-specific target name.
-        out_one = out_h.rename(columns={"label_excess": f"label_excess_{int(h)}d"})
+        out_one = out_h
         out_path = OUT_DIR / f"h{int(h)}.parquet"
         out_one.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path}")

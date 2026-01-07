@@ -274,6 +274,14 @@ class RobustMarketRegimeModel:
         if first_valid is not None:
             start_pos = int(r.index.get_indexer([first_valid])[0])
 
+        n_attempted = 0
+        n_skip_nan_window = 0
+        n_skip_too_short = 0
+        n_skip_nonfinite_features = 0
+        n_fit_failed = 0
+        n_score_failed = 0
+        n_written = 0
+
         for t_pos in range(t_start, len(r)):
             if self.window_mode == "rolling":
                 window_r = r.iloc[t_pos - self.window_size : t_pos]
@@ -281,14 +289,19 @@ class RobustMarketRegimeModel:
                 window_r = r.iloc[start_pos:t_pos]
             if self.window_mode == "rolling":
                 if window_r.isna().any():
+                    n_skip_nan_window += 1
                     continue
             else:
                 window_r = window_r.dropna()
                 if len(window_r) < effective_min_train:
+                    n_skip_too_short += 1
                     continue
+
+            n_attempted += 1
 
             X_window = self._build_features(window_r)
             if not np.isfinite(X_window).all():
+                n_skip_nonfinite_features += 1
                 continue
 
             best_model = self._best_hmm_fit(
@@ -300,6 +313,7 @@ class RobustMarketRegimeModel:
                 seed_base=t_pos,
             )
             if best_model is None:
+                n_fit_failed += 1
                 continue
 
             order = self._sorted_state_order_by_returns_variance(best_model)
@@ -322,6 +336,7 @@ class RobustMarketRegimeModel:
                 _, post = best_model.score_samples(X_window)
                 last_post = post[-1]
             except Exception:
+                n_score_failed += 1
                 continue
 
             last_post_sorted = last_post[order]
@@ -333,6 +348,24 @@ class RobustMarketRegimeModel:
 
             out.loc[dates[t_pos], "prob_low_vol"] = float(last_post_sorted[0])
             out.loc[dates[t_pos], "prob_high_vol"] = float(last_post_sorted[1])
+            n_written += 1
+
+            if self.debug_every and (t_pos % self.debug_every == 0):
+                cov = float(out["prob_high_vol"].notna().mean())
+                print(
+                    f"[HMM status] t_pos={t_pos} attempted={n_attempted} written={n_written} "
+                    f"coverage={cov:.3f} skip_nan_window={n_skip_nan_window} "
+                    f"skip_too_short={n_skip_too_short} skip_nonfinite={n_skip_nonfinite_features} "
+                    f"fit_failed={n_fit_failed} score_failed={n_score_failed}"
+                )
+
+        if self.debug_every:
+            cov = float(out["prob_high_vol"].notna().mean())
+            print(
+                f"[HMM final] attempted={n_attempted} written={n_written} coverage={cov:.3f} "
+                f"skip_nan_window={n_skip_nan_window} skip_too_short={n_skip_too_short} "
+                f"skip_nonfinite={n_skip_nonfinite_features} fit_failed={n_fit_failed} score_failed={n_score_failed}"
+            )
 
         return out
 
