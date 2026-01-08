@@ -235,3 +235,5 @@ ModularMonolith/data/**/*.png
 
 ModularMonolith/data/**/Graphs/
 ModularMonolith/data/**/Graphs/**
+
+diagnostics/

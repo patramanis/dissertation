@@ -295,21 +295,21 @@ def _load_regimes_features(data_dir: Path) -> pd.DataFrame | None:
 
     rg = pd.read_parquet(regimes_path)
     if "Date" in rg.columns:
-        rg = rg[["Date", *[c for c in ("hmm_raw", "hmm_trend", "hmm_delta") if c in rg.columns]]].copy()
+        rg = rg[["Date", *[c for c in ("hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]]].copy()
         _normalize_date_column(rg, name="regimes")
         rg = rg.sort_values("Date").drop_duplicates("Date", keep="last")
     else:
         idx = pd.to_datetime(rg.index, errors="raise")
         if getattr(idx, "tz", None) is not None:
             idx = idx.tz_localize(None)
-        keep = [c for c in ("hmm_raw", "hmm_trend", "hmm_delta") if c in rg.columns]
+        keep = [c for c in ("hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]
         if not keep:
             return None
         rg = rg[keep].copy()
         rg.index = pd.DatetimeIndex(idx, name="Date")
         rg = rg.sort_index().reset_index()
 
-    keep_cols = [c for c in ("Date", "hmm_raw", "hmm_trend", "hmm_delta") if c in rg.columns]
+    keep_cols = [c for c in ("Date", "hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]
     if keep_cols == ["Date"]:
         return None
     out = rg[keep_cols].copy()

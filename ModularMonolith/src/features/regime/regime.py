@@ -375,12 +375,39 @@ class RobustMarketRegimeModel:
         *,
         ewm_span: int = 10,
     ) -> pd.DataFrame:
+        """
+        Generate regime features from rolling HMM predictions.
+        
+        SIGNAL POLARITY DOCUMENTATION:
+        - hmm_raw (prob_high_vol): Probability of being in HIGH volatility state.
+          Higher values → turbulent market regime.
+          Interpretation: When hmm_raw is high, defensive sectors (XLP, XLU, XLV)
+          may outperform cyclicals (XLK, XLE, XLI).
+          
+        - hmm_trend: EWM smoothed version of hmm_raw for stability.
+        
+        - hmm_delta: Rate of change in regime probability.
+          Positive → transitioning toward higher volatility.
+          Negative → transitioning toward lower volatility.
+          
+        - hmm_low_vol: Probability of being in LOW volatility state (1 - hmm_raw).
+          Higher values → calm market regime.
+          This is the inverse of hmm_raw for clearer interpretation when needed.
+        
+        Args:
+            returns: Daily log returns series
+            ewm_span: EWM span for trend smoothing (default: 10)
+            
+        Returns:
+            DataFrame with hmm_raw, hmm_trend, hmm_delta, hmm_low_vol columns
+        """
         if ewm_span <= 0:
             raise ValueError("ewm_span must be positive")
 
         probs = self.predict_rolling(returns)
         hmm_raw = probs["prob_high_vol"].rename("hmm_raw")
+        hmm_low_vol = (1.0 - hmm_raw).rename("hmm_low_vol")
         hmm_trend = hmm_raw.ewm(span=int(ewm_span), adjust=False).mean().rename("hmm_trend")
         hmm_delta = hmm_trend.diff().fillna(0.0).rename("hmm_delta")
 
-        return pd.concat([hmm_raw, hmm_trend, hmm_delta], axis=1)
+        return pd.concat([hmm_raw, hmm_low_vol, hmm_trend, hmm_delta], axis=1)
