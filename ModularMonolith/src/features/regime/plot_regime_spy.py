@@ -165,15 +165,18 @@ def main() -> int:
 
     sys.path.insert(0, str(_repo_root()))
 
+    from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
     from ModularMonolith.src.features.regime import RobustMarketRegimeModel
 
-    logret = _load_spy_logret()
-    if args.start is not None:
-        logret = logret.loc[pd.Timestamp(args.start) :]
-    if args.end is not None:
-        logret = logret.loc[: pd.Timestamp(args.end)]
+    logret_full = _load_spy_logret()
+
+    out_start = args.start if args.start is not None else str(TRAIN_DATE_START)
+    out_end = args.end if args.end is not None else str(TRAIN_DATE_END)
+
+    logret_fit = logret_full
     if args.max_n is not None:
-        logret = logret.iloc[: int(args.max_n)]
+        logret_fit = logret_fit.iloc[: int(args.max_n)]
 
     model = RobustMarketRegimeModel(
         window_mode=str(args.window_mode),
@@ -183,14 +186,27 @@ def main() -> int:
         n_restarts=int(args.n_restarts),
     )
 
-    feats = model.predict_features(logret, ewm_span=int(args.ewm_span))
+    feats = model.predict_features(logret_fit, ewm_span=int(args.ewm_span))
 
     valid = feats["hmm_trend"].dropna()
     if len(valid):
         share_hi = float((valid > 0.5).mean())
         print(f"Valid points: {len(valid)}/{len(feats)} | Share high-vol (trend>0.5): {share_hi:.3f}")
 
-    equity = equity_from_log_returns(logret)
+    equity = equity_from_log_returns(logret_fit)
+
+    if out_start is not None:
+        s = pd.Timestamp(out_start)
+        feats = feats.loc[s:]
+        equity = equity.loc[s:]
+        logret_out = logret_fit.loc[s:]
+    else:
+        logret_out = logret_fit
+    if out_end is not None:
+        e = pd.Timestamp(out_end)
+        feats = feats.loc[:e]
+        equity = equity.loc[:e]
+        logret_out = logret_out.loc[:e]
 
     regimes_dir = _default_regimes_dir()
 
@@ -200,7 +216,7 @@ def main() -> int:
     default_parquet_out = regimes_dir / "spy_regimes.parquet"
     parquet_out = Path(args.out_parquet) if args.out_parquet is not None else default_parquet_out
 
-    save_regime_features(logret=logret, feats=feats, out_path=parquet_out)
+    save_regime_features(logret=logret_out, feats=feats, out_path=parquet_out)
 
     show = not args.no_show
     plot_regimes(equity=equity, feats=feats, out_path=out_path, show=show)

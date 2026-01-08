@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
 try:
     from ModularMonolith import build_id
 
@@ -397,6 +399,10 @@ def main() -> None:
 
     for h, spec in HORIZONS.items():
         df_out = build_processed_for_horizon(spdr_asof, spy_asof, spec)
+
+        df_out["Date"] = pd.to_datetime(df_out["Date"], errors="raise").dt.tz_localize(None)
+        df_out = df_out[(df_out["Date"] >= TRAIN_DATE_START) & (df_out["Date"] <= TRAIN_DATE_END)].copy()
+
         out_path = OUT_DIR / f"features_h{h}.parquet"
         df_out.to_parquet(out_path, index=False, engine="pyarrow")
         print(f"Wrote {out_path} shape={df_out.shape}")

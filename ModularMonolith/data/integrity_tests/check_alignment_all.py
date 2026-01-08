@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
 
 BASE = Path("ModularMonolith") / "data"
 RAW2 = BASE / "raw_data_2"
@@ -32,6 +34,7 @@ def main() -> None:
         raise FileNotFoundError(spdr2)
 
     anchor = _read_dates_parquet(spdr2)
+    anchor_train = anchor[(anchor >= TRAIN_DATE_START) & (anchor <= TRAIN_DATE_END)]
 
     required = [RAW2 / "SPY.parquet", RAW3 / "SPY.parquet"]
     for p in required:
@@ -47,7 +50,12 @@ def main() -> None:
         if len(d) == 0:
             bad_proc.append(f"processed_data_1/{p.name}")
             continue
-        if len(d.unique()) != len(anchor):
+
+        d_unique = pd.DatetimeIndex(pd.to_datetime(pd.Series(d).unique(), errors="raise")).sort_values()
+        if len(d_unique) != len(anchor_train):
+            bad_proc.append(f"processed_data_1/{p.name}")
+            continue
+        if set(d_unique.tolist()) != set(anchor_train.tolist()):
             bad_proc.append(f"processed_data_1/{p.name}")
             continue
 

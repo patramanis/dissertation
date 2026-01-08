@@ -8,6 +8,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
 try:
     from ModularMonolith import build_id
 
@@ -44,8 +46,8 @@ FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
 
 COST_THRESHOLD: dict[int, float] = {
     5: 0.001,
-    21: 0.002,
-    63: 0.005,
+    21: 0.001,
+    63: 0.001,
 }
 
 
@@ -54,10 +56,8 @@ def _resolve_label_excess_column(labels: pd.DataFrame, *, horizon: int) -> str:
     if "label_excess" in labels.columns:
         return "label_excess"
     if legacy in labels.columns:
-        raise ValueError(
-            f"Labels parquet uses legacy horizon-suffixed target column '{legacy}'. "
-            "Regenerate labels so the parquet contains canonical 'label_excess' (and keep horizon in filename/horizon column)."
-        )
+        labels["label_excess"] = labels[legacy]
+        return "label_excess"
     raise ValueError(
         "Labels parquet is missing the required canonical target column 'label_excess'. "
         f"Columns={sorted(map(str, labels.columns))}"
@@ -65,15 +65,16 @@ def _resolve_label_excess_column(labels: pd.DataFrame, *, horizon: int) -> str:
 
 
 def _maybe_validate_labels_horizon(labels: pd.DataFrame, *, horizon: int, labels_path: Path) -> None:
-    if "horizon" not in labels.columns:
-        return
-    h_unique = pd.to_numeric(labels["horizon"], errors="coerce").dropna().unique()
-    if h_unique.size == 0:
-        return
-    if h_unique.size != 1 or int(h_unique[0]) != int(horizon):
-        raise ValueError(
-            f"Labels horizon mismatch for {labels_path}: expected horizon={int(horizon)}; got unique={h_unique.tolist()}"
-        )
+    for col in ("horizon", "horizon_days"):
+        if col not in labels.columns:
+            continue
+        h_unique = pd.to_numeric(labels[col], errors="coerce").dropna().unique()
+        if h_unique.size == 0:
+            continue
+        if h_unique.size != 1 or int(h_unique[0]) != int(horizon):
+            raise ValueError(
+                f"Labels horizon mismatch for {labels_path}: expected horizon={int(horizon)}; got {col} unique={h_unique.tolist()}"
+            )
 
 
 def _rel_rank_per_date_from_excess(excess: pd.Series, *, cost: float) -> pd.Series:
@@ -324,6 +325,58 @@ def _assert_no_merge_suffix_columns(df: pd.DataFrame, *, name: str) -> None:
         )
 
 
+def _filter_train_window(df: pd.DataFrame, *, name: str) -> pd.DataFrame:
+    if "Date" not in df.columns:
+        raise ValueError(f"[{name}] Missing Date column for train-window filter")
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="raise")
+    if getattr(out["Date"].dt, "tz", None) is not None:
+        out["Date"] = out["Date"].dt.tz_localize(None)
+    m = (out["Date"] >= TRAIN_DATE_START) & (out["Date"] <= TRAIN_DATE_END)
+    return out.loc[m].copy()
+
+
+def _assert_same_date_set(a: pd.DataFrame, b: pd.DataFrame, *, name_a: str, name_b: str) -> None:
+    da = pd.DatetimeIndex(pd.to_datetime(a["Date"], errors="raise").dt.tz_localize(None).unique()).sort_values()
+    db = pd.DatetimeIndex(pd.to_datetime(b["Date"], errors="raise").dt.tz_localize(None).unique()).sort_values()
+    if da.equals(db):
+        return
+
+    sa = set(da.tolist())
+    sb = set(db.tolist())
+    only_a = sorted(sa - sb)
+    only_b = sorted(sb - sa)
+    raise AssertionError(
+        "Calendar mismatch between inputs after canonical 2005–2025 cut. "
+        f"{name_a}_dates={len(da)} {name_b}_dates={len(db)} "
+        f"{name_a}_only={len(only_a)} {name_b}_only={len(only_b)} "
+        f"{name_a}_range=[{(da.min().date() if len(da) else None)},{(da.max().date() if len(da) else None)}] "
+        f"{name_b}_range=[{(db.min().date() if len(db) else None)},{(db.max().date() if len(db) else None)}] "
+        f"sample_{name_a}_only={[d.date() for d in only_a[:5]]} sample_{name_b}_only={[d.date() for d in only_b[:5]]}"
+    )
+
+
+def _assert_same_panel_keys(a: pd.DataFrame, b: pd.DataFrame, *, name_a: str, name_b: str) -> None:
+    mi_a = pd.MultiIndex.from_frame(a[["Date", "Sector"]])
+    mi_b = pd.MultiIndex.from_frame(b[["Date", "Sector"]])
+    if mi_a.equals(mi_b):
+        return
+
+    sa = set(mi_a.tolist())
+    sb = set(mi_b.tolist())
+    only_a = list(sa - sb)
+    only_b = list(sb - sa)
+    only_a.sort()
+    only_b.sort()
+    fmt = lambda pairs: [(pd.Timestamp(d).date(), str(s)) for d, s in pairs]
+    raise AssertionError(
+        "Panel key mismatch between inputs (Date,Sector) after canonical cut. "
+        f"{name_a}_keys={len(mi_a)} {name_b}_keys={len(mi_b)} "
+        f"{name_a}_only={len(only_a)} {name_b}_only={len(only_b)} "
+        f"sample_{name_a}_only={fmt(only_a[:8])} sample_{name_b}_only={fmt(only_b[:8])}"
+    )
+
+
 def _build_rank_target(
     df: pd.DataFrame,
     *,
@@ -385,6 +438,7 @@ def load_dual_model_dataset(
     horizon: int,
     *,
     enforce_full_universe: bool = True,
+    require_regimes: bool = True,
     verbose: bool = True,
     features_path: Path | None = None,
     labels_path: Path | None = None,
@@ -398,7 +452,8 @@ def load_dual_model_dataset(
 
     if horizon not in COST_THRESHOLD:
         raise ValueError(f"Missing COST_THRESHOLD for horizon={horizon}; have keys={sorted(COST_THRESHOLD)}")
-    cost_threshold = float(COST_THRESHOLD[horizon])
+    default_cost_threshold = float(COST_THRESHOLD[horizon])
+    cost_threshold = float(default_cost_threshold)
 
     if features_path is None or labels_path is None or correlations_path is None or raw3_dir is None:
         d_features, d_labels, d_corr, d_raw3 = _paths_for_fusion(horizon)
@@ -427,6 +482,24 @@ def load_dual_model_dataset(
     label_excess_col = _resolve_label_excess_column(labels, horizon=horizon)
     target_col = label_excess_col
 
+    if "cost_bps" in labels.columns:
+        cb = pd.to_numeric(labels["cost_bps"], errors="coerce").dropna().unique()
+        if cb.size == 1:
+            cost_bps = float(cb[0])
+            derived = float(cost_bps) / 10_000.0
+            if not np.isfinite(derived) or derived < 0:
+                raise ValueError(f"Invalid cost_bps in labels: {cost_bps}")
+            if not np.isclose(derived, default_cost_threshold, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "Cost inconsistency: labels cost_bps disagrees with COST_THRESHOLD. "
+                    f"h={horizon} labels_cost_bps={cost_bps} -> {derived} vs COST_THRESHOLD={default_cost_threshold}"
+                )
+            cost_threshold = float(derived)
+        elif cb.size > 1:
+            raise ValueError(
+                f"Labels contain multiple cost_bps values for h={horizon}: {cb.tolist()}. Expected a single constant."
+            )
+
     keep_label_cols = ["Date", "Sector", label_excess_col]
     for extra in ("y_gate", "rel_rank", "cost_bps", "horizon"):
         if extra in labels.columns:
@@ -439,8 +512,25 @@ def load_dual_model_dataset(
 
     correlations_wide = _load_correlations_wide(correlations_path)
     macro = _load_raw3_macro_broadcast(raw3_dir)
-    regimes = _load_regimes_features(Path(__file__).resolve().parent)
+
+    regimes_dir = Path(__file__).resolve().parent
+    regimes_path = regimes_dir / "regimes" / "spy_regimes.parquet"
+    regimes = _load_regimes_features(regimes_dir)
+
+    if require_regimes and (regimes is None or regimes.empty):
+        raise FileNotFoundError(
+            "Required HMM regimes parquet is missing or empty. "
+            f"Expected: {regimes_path}"
+        )
+
     if regimes is not None and not regimes.empty:
+        req_cols = ["hmm_raw", "hmm_trend", "hmm_delta"]
+        missing = [c for c in req_cols if c not in regimes.columns]
+        if require_regimes and missing:
+            raise ValueError(
+                "HMM regimes parquet is missing required columns. "
+                f"Missing={missing} columns={sorted(map(str, regimes.columns))} path={regimes_path}"
+            )
         macro = macro.merge(regimes, on="Date", how="outer")
 
     drop_from_p1 = [c for c in features_p1.columns if isinstance(c, str) and c.startswith("label_")]
@@ -459,6 +549,14 @@ def load_dual_model_dataset(
     _ensure_unique_key(features_p1, ["Date", "Sector"], name="features_p1")
     _ensure_unique_key(labels, ["Date", "Sector"], name="labels")
 
+    labels = _filter_train_window(labels, name="labels")
+    features_p1 = _filter_train_window(features_p1, name="features_p1")
+    correlations_wide = _filter_train_window(correlations_wide, name="correlations_wide")
+    macro = _filter_train_window(macro, name="raw3_macro")
+
+    _assert_same_date_set(labels, features_p1, name_a="labels", name_b="features_p1")
+    _assert_same_panel_keys(labels, features_p1, name_a="labels", name_b="features_p1")
+
     merged = labels.copy()
 
     merged = merged.merge(features_p1, on=["Date", "Sector"], how="inner")
@@ -471,6 +569,29 @@ def load_dual_model_dataset(
     _normalize_date_column(macro, name="raw3_macro")
     _ensure_unique_key(macro, ["Date"], name="raw3_macro")
     merged = merged.merge(macro, on=["Date"], how="left")
+
+    if require_regimes:
+        req_cols = ["hmm_raw", "hmm_trend", "hmm_delta"]
+        missing = [c for c in req_cols if c not in merged.columns]
+        if missing:
+            raise RuntimeError(
+                "HMM regimes columns are missing after merge; expected them to be present in merged dataset. "
+                f"Missing={missing}"
+            )
+        nan_any = merged[req_cols].isna().any(axis=1)
+        if bool(nan_any.any()):
+            bad_dates = (
+                pd.to_datetime(merged.loc[nan_any, "Date"], errors="raise")
+                .dt.tz_localize(None)
+                .drop_duplicates()
+                .sort_values()
+            )
+            sample = [d.date() for d in bad_dates.iloc[:10].tolist()]
+            raise ValueError(
+                "HMM regimes contain NaNs after merge into dataset. "
+                "Regimes must be fully populated over the training window to avoid silent feature holes. "
+                f"bad_dates={len(bad_dates)} sample={sample}"
+            )
 
     _assert_no_merge_suffix_columns(merged, name="merged")
 

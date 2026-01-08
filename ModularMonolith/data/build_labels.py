@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
 try:
     from ModularMonolith import build_id
 
@@ -15,10 +17,24 @@ except Exception:
 
 LABELS_DIR = Path(__file__).resolve().parent
 DATA_DIR = LABELS_DIR
-RAW2_DIR = DATA_DIR / "raw_data_2"
 OUT_DIR = LABELS_DIR / "labels"
-SPDR_PARQUET = RAW2_DIR / "SPDR.parquet"
-SPY_PARQUET = RAW2_DIR / "SPY.parquet"
+
+UNSHIFTED_LABEL_INPUTS_DIR = OUT_DIR / "unshifted_lagged_raw_data"
+
+LABEL_DATE_START = TRAIN_DATE_START
+LABEL_DATE_END = TRAIN_DATE_END
+
+EXPECTED_SECTORS: tuple[str, ...] = (
+    "XLB",
+    "XLE",
+    "XLF",
+    "XLI",
+    "XLK",
+    "XLP",
+    "XLY",
+    "XLV",
+    "XLU",
+)
 
 
 def _read_parquet(path: Path) -> pd.DataFrame:
@@ -30,37 +46,66 @@ def _read_parquet(path: Path) -> pd.DataFrame:
     return df
 
 
+def _filter_label_date_range(df: pd.DataFrame) -> pd.DataFrame:
+    if "Date" not in df.columns:
+        raise ValueError("Expected Date column for label date filtering")
+    dt = pd.to_datetime(df["Date"], errors="raise")
+    mask = (dt >= LABEL_DATE_START) & (dt <= LABEL_DATE_END)
+    return df.loc[mask].copy()
+
+
+def _load_unshifted_prices_for_horizon(h: int) -> pd.DataFrame:
+    path = UNSHIFTED_LABEL_INPUTS_DIR / f"prices_h{int(h)}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing unshifted label input prices for horizon={int(h)} at {path}. "
+            "Run data_optimization_1.py to generate labels/unshifted_lagged_raw_data." 
+        )
+
+    df = _read_parquet(path)
+
+    required = {"Date", "SPY", *EXPECTED_SECTORS}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Unshifted label prices missing columns in {path}: {missing}")
+
+    df = df[["Date", "SPY", *EXPECTED_SECTORS]].copy()
+
+    value_cols = ["SPY", *EXPECTED_SECTORS]
+    for c in value_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[value_cols] = df[value_cols].ffill(limit=5)
+
+    df = _filter_label_date_range(df)
+    return df
+
+
 def build_excess_labels(
-    spdr_df: pd.DataFrame,
-    spy_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
     horizons: list[int],
     *,
     cost_bps: float,
 ) -> dict[int, pd.DataFrame]:
-    if "Date" not in spdr_df.columns:
-        raise ValueError("spdr_df must contain Date")
-    if "Date" not in spy_df.columns or "SPY" not in spy_df.columns:
-        raise ValueError("spy_df must contain Date and SPY")
+    if "Date" not in prices_df.columns:
+        raise ValueError("prices_df must contain Date")
+    if "SPY" not in prices_df.columns:
+        raise ValueError("prices_df must contain SPY")
     if not horizons:
         raise ValueError("horizons must be non-empty")
 
-    sectors = [c for c in spdr_df.columns if c != "Date"]
-    if not sectors:
-        raise ValueError("SPDR sector set is empty")
+    sectors = [s for s in EXPECTED_SECTORS if s in prices_df.columns]
+    if len(sectors) != len(EXPECTED_SECTORS):
+        raise ValueError(f"prices_df missing expected sectors: have={sectors} expected={list(EXPECTED_SECTORS)}")
 
-    spdr = spdr_df.copy()
-    spy = spy_df[["Date", "SPY"]].copy()
-
-    spdr["Date"] = pd.to_datetime(spdr["Date"], errors="raise").dt.normalize().dt.tz_localize(None)
-    spy["Date"] = pd.to_datetime(spy["Date"], errors="raise").dt.normalize().dt.tz_localize(None)
-
-    df = spdr.merge(spy, on="Date", how="left")
+    df = prices_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="raise").dt.normalize().dt.tz_localize(None)
     df = df.sort_values("Date").reset_index(drop=True)
 
     spy_px = pd.to_numeric(df["SPY"], errors="coerce")
+    spy_px_asof = spy_px.shift(1)
     spy_rets: dict[int, pd.Series] = {}
     for h in horizons:
-        spy_rets[h] = (spy_px.shift(-h) / spy_px) - 1.0
+        spy_rets[h] = (spy_px_asof.shift(-h) / spy_px_asof) - 1.0
 
     cost = float(cost_bps) / 10_000.0
     out_by_h: dict[int, pd.DataFrame] = {}
@@ -88,7 +133,8 @@ def build_excess_labels(
 
         for sector in sectors:
             px = pd.to_numeric(df[sector], errors="coerce")
-            sec_ret = (px.shift(-h) / px) - 1.0
+            px_asof = px.shift(1)
+            sec_ret = (px_asof.shift(-h) / px_asof) - 1.0
             label_excess = sec_ret - spy_ret
 
             y_gate = pd.Series(pd.NA, index=label_excess.index, dtype="Int8")
@@ -146,14 +192,14 @@ def _print_timing_diagnostic(
     px_sec = pd.to_numeric(df[sec_name], errors="coerce")
     dates = pd.to_datetime(df["Date"], errors="raise")
 
-    print("\nTIMING DIAGNOSTIC (raw_data_2 already has P_{t-1} at Date=T)")
+    print("\nTIMING DIAGNOSTIC (unshifted label inputs)")
     print(f"Sector check: {sec_name} | samples={n_samples} | seed={seed}")
 
     for h in horizons:
-        denom_spy = px_spy
-        numer_spy = px_spy.shift(-h)
-        denom_sec = px_sec
-        numer_sec = px_sec.shift(-h)
+        denom_spy = px_spy.shift(1)
+        numer_spy = denom_spy.shift(-h)
+        denom_sec = px_sec.shift(1)
+        numer_sec = denom_sec.shift(-h)
 
         spy_ret = (numer_spy / denom_spy) - 1.0
         sec_ret = (numer_sec / denom_sec) - 1.0
@@ -166,7 +212,7 @@ def _print_timing_diagnostic(
             continue
 
         sample_idx = ok_idx.to_series().sample(n=min(n_samples, len(ok_idx)), random_state=seed).sort_values()
-        print(f"\n[h={h}] Showing Date=T with denom=P_(t-1), numer=P_(t+h-1)")
+        print(f"\n[h={h}] Showing Date=T with denom=Price(T-1), numer=Price(T+h-1)")
         for i in sample_idx.tolist():
             dt = dates.iloc[i].date().isoformat()
             d_spy = float(denom_spy.iloc[i])
@@ -182,13 +228,31 @@ def _print_timing_diagnostic(
                 f" | excess={ex:+.6f}"
             )
 
+    for h in horizons:
+        denom_spy = px_spy.shift(1)
+        denom_sec = px_sec.shift(1)
+        spy_ret = (denom_spy.shift(-h) / denom_spy) - 1.0
+        sec_ret = (denom_sec.shift(-h) / denom_sec) - 1.0
+        excess = sec_ret - spy_ret
+        tail = excess.tail(h)
+        non_nan = int(pd.to_numeric(tail, errors="coerce").notna().sum())
+        if non_nan != 0:
+            raise RuntimeError(
+                f"Tail forward targets should be all-NaN for h={h}, but found non-NaN count={non_nan}"
+            )
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build sector excess-return labels from raw_data_2 (already shifted).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build sector excess-return labels from unshifted label input prices, "
+            "using as-of (Close(T-1)) timing so Date=T labels align with PIT features."
+        )
+    )
     parser.add_argument(
         "--diagnostic",
         action="store_true",
-        help="Print timing diagnostic examples to verify denom=P_{t-1} and numer=P_{t+h-1}.",
+        help="Print timing diagnostic examples to verify denom=Price(T-1) and numer=Price(T+h-1).",
     )
     parser.add_argument("--diagnostic-n", type=int, default=5, help="Number of sample rows per horizon.")
     parser.add_argument("--diagnostic-seed", type=int, default=7, help="Random seed for sampling diagnostic rows.")
@@ -210,48 +274,18 @@ def main() -> None:
 
     print(f"[build_labels] BUILD_ID={BUILD_ID}")
 
-    for p in (SPDR_PARQUET, SPY_PARQUET):
-        if not p.exists():
-            raise FileNotFoundError(p)
-
-    spdr = _read_parquet(SPDR_PARQUET)
-    spy = _read_parquet(SPY_PARQUET)
-
-    spdr = spdr.sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
-    spy = spy.sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
-
-    assert (
-        spdr["Date"].is_monotonic_increasing
-        and spdr["Date"].is_unique
-        and spy["Date"].is_monotonic_increasing
-        and spy["Date"].is_unique
-    )
-
-    spdr["Date"] = pd.to_datetime(spdr["Date"]).dt.normalize().dt.tz_localize(None)
-    spy["Date"] = pd.to_datetime(spy["Date"]).dt.normalize().dt.tz_localize(None)
-
-    if "SPY" not in spy.columns:
-        raise ValueError("Missing SPY column in raw_data_2/SPY.parquet")
-
-    sectors = [c for c in spdr.columns if c != "Date"]
-    assert len(sectors) > 0
-
     horizons = [int(h) for h in args.horizons]
 
-    df_diag = spdr.merge(spy[["Date", "SPY"]], on="Date", how="left")
     if args.diagnostic:
-        spy_nan_frac = float(pd.to_numeric(df_diag["SPY"], errors="coerce").isna().mean())
-        print(f"SPY NaN fraction after merge: {spy_nan_frac:.6f}")
-        sec_nan_frac = float(pd.to_numeric(df_diag[sectors], errors="coerce").isna().mean().mean())
-        print(f"Sector NaN fraction (avg across sectors): {sec_nan_frac:.6f}")
+        prices_diag = _load_unshifted_prices_for_horizon(horizons[0])
+        sectors = [s for s in EXPECTED_SECTORS]
+        spy_nan_frac = float(pd.to_numeric(prices_diag["SPY"], errors="coerce").isna().mean())
+        print(f"SPY NaN fraction in unshifted label inputs: {spy_nan_frac:.6f}")
+        sec_nan_frac = float(prices_diag[sectors].apply(pd.to_numeric, errors="coerce").isna().mean().mean())
+        print(f"Sector NaN fraction (avg across sectors) in unshifted label inputs: {sec_nan_frac:.6f}")
 
-    spy_px = pd.to_numeric(df_diag["SPY"], errors="coerce")
-    for h in horizons:
-        df_diag[f"SPY_ret_{h}d"] = (spy_px.shift(-h) / spy_px) - 1.0
-
-    if args.diagnostic:
         _print_timing_diagnostic(
-            df=df_diag,
+            df=prices_diag,
             sectors=sectors,
             horizons=horizons,
             sector_for_check=args.diagnostic_sector,
@@ -259,12 +293,16 @@ def main() -> None:
             seed=int(args.diagnostic_seed),
         )
 
-    out_by_h = build_excess_labels(spdr, spy, horizons, cost_bps=float(args.cost_bps))
+    out_by_h: dict[int, pd.DataFrame] = {}
+    for h in horizons:
+        prices = _load_unshifted_prices_for_horizon(int(h))
+        out_one = build_excess_labels(prices, [int(h)], cost_bps=float(args.cost_bps))[int(h)]
+        out_by_h[int(h)] = out_one
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     expected_cols = {"Date", "Sector", "label_excess", "y_gate", "rel_rank", "cost_bps", "horizon"}
     assert all(set(out_h.columns) == expected_cols for out_h in out_by_h.values())
-    assert all(int(out_h.shape[0]) == int(spdr.shape[0]) * len(sectors) for out_h in out_by_h.values())
+    assert all(int(out_h["Sector"].nunique()) == len(EXPECTED_SECTORS) for out_h in out_by_h.values())
 
     for h in horizons:
         out_h = out_by_h[int(h)]

@@ -5,6 +5,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from ModularMonolith.data.train_window import TRAIN_DATE_END, TRAIN_DATE_START
+
 
 SECTOR_MACRO_WINDOWS: tuple[int, ...] = (21, 63, 126)
 MIN_PERIODS_BY_WINDOW: dict[int, int] = {
@@ -64,17 +66,23 @@ def _load_spdr_prices(spdr_path: Path) -> pd.DataFrame:
 def _load_macro(raw_data_3_dir: Path, *, strict: bool = True) -> pd.DataFrame:
     futures_path = raw_data_3_dir / "Futures.parquet"
     tlt_path = raw_data_3_dir / "TLT.parquet"
+    baml_path = raw_data_3_dir / "BAMLH0A0HYM2.parquet"
 
     _require_file(futures_path)
     _require_file(tlt_path)
+    _require_file(baml_path)
 
     futures = pd.read_parquet(futures_path)
     if strict:
-        _require_columns(futures, futures_path, ["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"])
-        futures = futures[["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"]].copy()
+        _require_columns(
+            futures,
+            futures_path,
+            ["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"],
+        )
+        futures = futures[["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]].copy()
     else:
         _require_columns(futures, futures_path, ["Date"])
-        wanted = ["^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret"]
+        wanted = ["^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]
         keep = [c for c in wanted if c in futures.columns]
         missing = [c for c in wanted if c not in futures.columns]
         if missing:
@@ -95,7 +103,20 @@ def _load_macro(raw_data_3_dir: Path, *, strict: bool = True) -> pd.DataFrame:
     for df in (futures, tlt):
         df["Date"] = pd.to_datetime(df["Date"], utc=False)
 
+    baml = pd.read_parquet(baml_path)
+    if strict:
+        _require_columns(baml, baml_path, ["Date", "BAMLH0A0HYM2_diff"])
+        baml = baml[["Date", "BAMLH0A0HYM2_diff"]].copy()
+    else:
+        _require_columns(baml, baml_path, ["Date"])
+        keep = [c for c in ["BAMLH0A0HYM2_diff"] if c in baml.columns]
+        if not keep:
+            print("WARNING: BAMLH0A0HYM2.parquet missing 'BAMLH0A0HYM2_diff'. Proceeding without HY spread driver.")
+        baml = baml[["Date", *keep]].copy()
+    baml["Date"] = pd.to_datetime(baml["Date"], utc=False)
+
     macro = futures.merge(tlt, on="Date", how="outer")
+    macro = macro.merge(baml, on="Date", how="outer")
     macro = macro.sort_values("Date")
     return macro
 
@@ -124,6 +145,9 @@ def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: 
         "oil": "CL=F_diff",
         "usd": "DX-Y.NYB_logret",
         "bonds": "TLT_logret",
+        "vix": "^VIX_dlog1p",
+        "hy": "BAMLH0A0HYM2_diff",
+        "gold": "GC=F_logret",
     }
 
     df = macro.copy()
@@ -172,6 +196,9 @@ def _rolling_corr_against_drivers(
         "oil": "CL=F_diff",
         "usd": "DX-Y.NYB_logret",
         "bonds": "TLT_logret",
+        "vix": "^VIX_dlog1p",
+        "hy": "BAMLH0A0HYM2_diff",
+        "gold": "GC=F_logret",
     }
 
     long_frames: list[pd.DataFrame] = []
@@ -268,6 +295,10 @@ def main() -> None:
     features_long = features_long.sort_values(["Date", "Sector", "Feature"], kind="mergesort")
 
     out_path = out_dir / "features_correlations.parquet"
+    features_long["Date"] = pd.to_datetime(features_long["Date"], errors="raise").dt.tz_localize(None)
+    features_long = features_long[
+        (features_long["Date"] >= TRAIN_DATE_START) & (features_long["Date"] <= TRAIN_DATE_END)
+    ].copy()
     features_long.to_parquet(out_path, index=False)
 
     print(f"Wrote {len(features_long):,} rows to: {out_path}")

@@ -381,6 +381,6 @@ class RobustMarketRegimeModel:
         probs = self.predict_rolling(returns)
         hmm_raw = probs["prob_high_vol"].rename("hmm_raw")
         hmm_trend = hmm_raw.ewm(span=int(ewm_span), adjust=False).mean().rename("hmm_trend")
-        hmm_delta = hmm_trend.diff().rename("hmm_delta")
+        hmm_delta = hmm_trend.diff().fillna(0.0).rename("hmm_delta")
 
         return pd.concat([hmm_raw, hmm_trend, hmm_delta], axis=1)

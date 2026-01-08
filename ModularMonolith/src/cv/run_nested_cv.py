@@ -697,6 +697,18 @@ def run_outer_folds(
     if len(X) != len(y) or len(X) != len(groups):
         raise ValueError("X, y, groups must have the same length")
 
+    if "cost_bps" in y.columns:
+        cb = pd.to_numeric(y["cost_bps"], errors="coerce").dropna().unique()
+        if cb.size == 1:
+            y_cost_bps = float(cb[0])
+            if not np.isclose(float(config.cost_bps), y_cost_bps, rtol=0.0, atol=1e-9):
+                raise ValueError(
+                    "cost_bps mismatch between dataset labels and NestedCVConfig. "
+                    f"y_cost_bps={y_cost_bps} config.cost_bps={float(config.cost_bps)}"
+                )
+        elif cb.size > 1:
+            raise ValueError(f"y contains multiple cost_bps values: {cb.tolist()}")
+
     oof_rows: list[pd.DataFrame] = []
 
     for fold_id, (outer_train_idx, outer_test_idx) in enumerate(outer_cv.split(X, y, groups=groups)):
