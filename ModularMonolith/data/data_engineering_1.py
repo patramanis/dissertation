@@ -143,25 +143,12 @@ def _download_spy(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
 
 
 def _load_spy_asof(trading_dates: pd.DatetimeIndex) -> pd.Series:
-    """
-    Load SPY prices aligned to trading dates with PIT (point-in-time) shift.
-    
-    CRITICAL: raw_data_2/SPY.parquet already has shift(1) applied by data_optimization_1.py.
-    We should ONLY use RAW2 to ensure consistency with all other features.
-    If RAW2 doesn't exist, we raise an error rather than applying inconsistent shifts.
-    
-    Returns:
-        Series with SPY(T-1) values indexed by trading dates, suitable for computing
-        features that are available at Open(T).
-    """
     if not SPY_RAW2.exists():
         raise FileNotFoundError(
             f"Missing PIT-aligned SPY data at {SPY_RAW2}. "
             "Run data_optimization_1.py first to generate raw_data_2/*.parquet files."
         )
     
-    # raw_data_2/SPY.parquet already has shift(1) applied by data_optimization_1.py
-    # Date=T contains SPY Close(T-1) which is available at Open(T)
     df = _read_parquet(SPY_RAW2)
     df["Date"] = pd.to_datetime(df["Date"]).dt.normalize().dt.tz_localize(None)
     s = pd.to_numeric(df.set_index("Date")["SPY"], errors="coerce").reindex(trading_dates)

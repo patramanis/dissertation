@@ -106,11 +106,8 @@ def _policy_for_basename(basename: str, df: pd.DataFrame) -> Policy:
     if basename == "NFCI":
         return Policy(kind="weekly", lag_days=7, ref_floor=lambda s: _floor_to_weekday(s, 4), ffill_limit=10)
     if basename == "UNRATE":
-        # Monthly data: add 45-day ffill limit to prevent stale values propagating indefinitely
-        # 45 trading days ≈ 2 months, so if a release is missing we still have a reasonable limit
         return Policy(kind="monthly", lag_months=1, lag_days=10, ffill_limit=45)
     if basename in {"CPIAUCSL", "INDPRO"}:
-        # Monthly data: add 45-day ffill limit to prevent stale values propagating indefinitely
         return Policy(kind="monthly", lag_months=1, lag_days=20, ffill_limit=45)
 
     if basename == "GPR":
@@ -193,10 +190,6 @@ def _mapped_ffilled_frame(csv_path: Path, trading_dates: pd.DatetimeIndex, *, va
             raise AssertionError(f"Leakage: values present before first availability for {basename}")
 
     out = mapped.reindex(trading_dates)
-    # Apply ffill with limit for all data types to prevent stale values
-    # For daily: limit=5 trading days
-    # For weekly: limit=10 trading days (~2 weeks)  
-    # For monthly: limit=45 trading days (~2 months)
     if policy.ffill_limit is not None:
         out = out.ffill(limit=policy.ffill_limit)
     else:

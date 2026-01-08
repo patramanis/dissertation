@@ -347,7 +347,7 @@ def _assert_same_date_set(a: pd.DataFrame, b: pd.DataFrame, *, name_a: str, name
     only_a = sorted(sa - sb)
     only_b = sorted(sb - sa)
     raise AssertionError(
-        "Calendar mismatch between inputs after canonical 2005–2025 cut. "
+        "Calendar mismatch between inputs after canonical 2005 - 2025 cut. "
         f"{name_a}_dates={len(da)} {name_b}_dates={len(db)} "
         f"{name_a}_only={len(only_a)} {name_b}_only={len(only_b)} "
         f"{name_a}_range=[{(da.min().date() if len(da) else None)},{(da.max().date() if len(da) else None)}] "
