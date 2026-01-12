@@ -77,13 +77,15 @@ HORIZONS: dict[int, HorizonSpec] = {
 }
 
 
-def _read_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if "Date" not in df.columns:
-        raise ValueError(f"Missing Date column in {path}")
-    df["Date"] = pd.to_datetime(df["Date"], errors="raise")
-    df = df.sort_values("Date").drop_duplicates("Date", keep="last")
-    return df
+def _check_duplicates(df: pd.DataFrame, path: Path | str) -> None:
+    norm = df["Date"].dt.normalize()
+    dup_mask = norm.duplicated(keep=False)
+    if bool(dup_mask.any()):
+        dup_dates = norm.loc[dup_mask].value_counts().sort_values(ascending=False).head(10)
+        examples = ", ".join([f"{d.date()}(x{int(c)})" for d, c in dup_dates.items()])
+        raise ValueError(
+            f"Duplicate Date rows in {path}: n_dup={int(dup_mask.sum())} examples=[{examples}]"
+        )
 
 
 def _read_parquet(path: Path) -> pd.DataFrame:
@@ -91,55 +93,9 @@ def _read_parquet(path: Path) -> pd.DataFrame:
     if "Date" not in df.columns:
         raise ValueError(f"Missing Date column in {path}")
     df["Date"] = pd.to_datetime(df["Date"], errors="raise")
-    df = df.sort_values("Date").drop_duplicates("Date", keep="last")
+    df = df.sort_values("Date")
+    _check_duplicates(df, path)
     return df
-
-
-def _read_panel_parquet(path: Path, key_cols: list[str]) -> pd.DataFrame:
-    df = pd.read_parquet(path, engine="pyarrow")
-    for c in key_cols:
-        if c not in df.columns:
-            raise ValueError(f"Missing {c} column in {path}")
-    df["Date"] = pd.to_datetime(df["Date"], errors="raise")
-    df = df.sort_values(key_cols)
-    df = df.drop_duplicates(subset=key_cols, keep="last")
-    return df
-
-
-def _download_spy(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    import yfinance as yf
-
-    df = yf.download(
-        "SPY",
-        start=str(start.date()),
-        end=str((end + pd.Timedelta(days=1)).date()),
-        auto_adjust=False,
-        progress=False,
-        actions=False,
-        group_by="column",
-    )
-    if df is None or df.empty:
-        raise RuntimeError("yfinance returned empty data for SPY")
-
-    if isinstance(df.columns, pd.MultiIndex):
-        if ("Adj Close", "SPY") not in df.columns:
-            raise RuntimeError("SPY download missing ('Adj Close','SPY')")
-        s = df[("Adj Close", "SPY")].rename("SPY")
-    else:
-        if "Adj Close" not in df.columns:
-            raise RuntimeError("SPY download missing 'Adj Close'")
-        s = df["Adj Close"].rename("SPY")
-
-    out = s.to_frame()
-    out.index = pd.to_datetime(out.index).tz_localize(None)
-    out = out.reset_index()
-    out = out.loc[:, ~out.columns.duplicated()]
-    first = out.columns[0]
-    if first != "Date":
-        out = out.rename(columns={first: "Date"})
-    out["Date"] = pd.to_datetime(out["Date"], errors="raise").dt.tz_localize(None)
-    out = out.sort_values("Date").drop_duplicates("Date", keep="last")
-    return out
 
 
 def _load_spy_asof(trading_dates: pd.DatetimeIndex) -> pd.Series:
@@ -172,17 +128,6 @@ def _rolling_max_drawdown(prices: np.ndarray) -> float:
     return float(np.min(dd))
 
 
-def _rolling_downside_semivol(x: np.ndarray) -> float:
-    if x.size == 0:
-        return np.nan
-    if np.isnan(x).any():
-        return np.nan
-    neg = x[x < 0]
-    if neg.size == 0:
-        return 0.0
-    return float(np.std(neg, ddof=0))
-
-
 def _compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
     return np.log(prices).diff(1)
 
@@ -210,22 +155,9 @@ def _beta_and_corr(r_s: pd.DataFrame, r_m: pd.Series, window: int) -> tuple[pd.D
 
 
 def _idio_vol(r_s: pd.DataFrame, r_m: pd.Series, window: int) -> pd.DataFrame:
-    beta, _ = _beta_and_corr(r_s, r_m, window)
-    m_s = r_s.rolling(window, min_periods=window).mean()
-    m_m = r_m.rolling(window, min_periods=window).mean()
-    alpha = m_s.sub(beta.mul(m_m, axis=0))
-
-    fitted = alpha.add(beta.mul(r_m, axis=0))
-    resid = r_s - fitted
-
-    return resid.rolling(window, min_periods=window).std(ddof=0)
-
-
-def _melt_features(df_wide: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    out = df_wide.copy()
-    out.index.name = "Date"
-    out = out.reset_index().melt(id_vars=["Date"], var_name="Sector", value_name=prefix)
-    return out
+    _, corr = _beta_and_corr(r_s, r_m, window)
+    vol_s = r_s.rolling(window, min_periods=window).std(ddof=0)
+    return vol_s * np.sqrt(1 - corr ** 2)
 
 
 def _cross_sectional_ranks(df_long: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
@@ -250,118 +182,93 @@ def build_processed_for_horizon(
     logret_s = _compute_returns(prices)
     logret_m = _compute_returns(spy_px.to_frame())["SPY"]
 
-    logret_1d = logret_s.copy()
-    logret_1d.columns = [f"{c}_logret1d" for c in logret_1d.columns]
-    feats_wide: dict[str, pd.DataFrame] = {"logret_1d": logret_1d}
+    feats_wide: dict[str, pd.DataFrame] = {}
 
-    excess_1d = logret_s.sub(logret_m, axis=0)
-    excess_1d.columns = [f"{c}_excess1d" for c in excess_1d.columns]
+    logret_1d = logret_s.copy()
+    logret_1d.columns = [f"{c}_logret1d" for c in SECTORS]
+    feats_wide["logret_1d"] = logret_1d
+
+    excess = logret_s.sub(logret_m, axis=0)
+    excess_1d = excess.copy()
+    excess_1d.columns = [f"{c}_excess1d" for c in SECTORS]
     feats_wide["excess_1d"] = excess_1d
 
-    excess_5d = logret_s.sub(logret_m, axis=0).rolling(5, min_periods=5).sum()
-    excess_5d.columns = [f"{c}_excess5d" for c in excess_5d.columns]
+    excess_5d = excess.rolling(5, min_periods=5).sum()
+    excess_5d.columns = [f"{c}_excess5d" for c in SECTORS]
     feats_wide["excess_5d"] = excess_5d
 
     ratio = np.log(prices.div(spy_px, axis=0))
 
-    ratio_level = ratio.copy()
-    ratio_level.columns = [f"{c}_ratio_level" for c in ratio_level.columns]
-    feats_wide["ratio_level"] = ratio_level
-
     for w in spec.ratio_z_windows:
         z = ratio.apply(lambda s: _rolling_zscore(s, w))
-        z.columns = [f"{c}_ratio_z{w}" for c in z.columns]
+        z.columns = [f"{c}_ratio_z{w}" for c in SECTORS]
         feats_wide[f"ratio_z{w}"] = z
 
-    rel = logret_s.sub(logret_m, axis=0)
     for L in spec.relmom_lookbacks:
-        m = rel.rolling(L, min_periods=L).sum()
-        m.columns = [f"{c}_relmom{L}" for c in m.columns]
+        m = excess.rolling(L, min_periods=L).sum()
+        m.columns = [f"{c}_relmom{L}" for c in SECTORS]
         feats_wide[f"relmom{L}"] = m
 
     fast, slow = spec.trend_mas
-    ma_fast = ratio.rolling(fast, min_periods=fast).mean()
-    ma_slow = ratio.rolling(slow, min_periods=slow).mean()
-    spread = ma_fast - ma_slow
-    spread.columns = [f"{c}_ratio_ma{fast}_{slow}" for c in spread.columns]
+    spread = ratio.rolling(fast, min_periods=fast).mean() - ratio.rolling(slow, min_periods=slow).mean()
+    spread.columns = [f"{c}_ratio_ma{fast}_{slow}" for c in SECTORS]
     feats_wide[f"ratio_ma{fast}_{slow}"] = spread
 
     for w in spec.beta_windows:
         beta, corr = _beta_and_corr(logret_s, logret_m, w)
-        beta.columns = [f"{c}_beta{w}" for c in beta.columns]
-        corr.columns = [f"{c}_corr{w}" for c in corr.columns]
+        beta.columns = [f"{c}_beta{w}" for c in SECTORS]
+        corr.columns = [f"{c}_corr{w}" for c in SECTORS]
         feats_wide[f"beta{w}"] = beta
         feats_wide[f"corr{w}"] = corr
 
     idio = _idio_vol(logret_s, logret_m, spec.idio_window)
-    idio.columns = [f"{c}_idio_vol{spec.idio_window}" for c in idio.columns]
+    idio.columns = [f"{c}_idio_vol{spec.idio_window}" for c in SECTORS]
     feats_wide[f"idio{spec.idio_window}"] = idio
 
     vols: dict[int, pd.DataFrame] = {}
     for w in spec.vol_windows:
         v = logret_s.rolling(w, min_periods=w).std(ddof=0)
-        v.columns = [f"{c}_vol{w}" for c in v.columns]
+        v.columns = [f"{c}_vol{w}" for c in SECTORS]
         vols[w] = v
         feats_wide[f"vol{w}"] = v
 
-    if spec.h == 5:
-        if 5 in vols and 63 in vols:
-            vr = vols[5].to_numpy() / vols[63].to_numpy()
-            vr = pd.DataFrame(vr, index=vols[5].index, columns=[c.replace("_vol5", "_vol5_over_63") for c in vols[5].columns])
-            feats_wide["vol_ratio"] = vr
-    if spec.h == 21:
-        if 21 in vols and 126 in vols:
-            vr = vols[21].to_numpy() / vols[126].to_numpy()
-            vr = pd.DataFrame(vr, index=vols[21].index, columns=[c.replace("_vol21", "_vol21_over_126") for c in vols[21].columns])
+    vol_ratio_map = {5: (5, 63), 21: (21, 126)}
+    if spec.h in vol_ratio_map:
+        short_w, long_w = vol_ratio_map[spec.h]
+        if short_w in vols and long_w in vols:
+            vr = vols[short_w] / vols[long_w]
+            vr.columns = [f"{c.replace(f'_vol{short_w}', f'_vol{short_w}_over_{long_w}')}" for c in vr.columns]
             feats_wide["vol_ratio"] = vr
 
-    for w in set([spec.mdd_window]):
-        mdd = prices.rolling(w, min_periods=w).apply(_rolling_max_drawdown, raw=True)
-        mdd.columns = [f"{c}_mdd{w}" for c in mdd.columns]
-        feats_wide[f"mdd{w}"] = mdd
+    mdd = prices.rolling(spec.mdd_window, min_periods=spec.mdd_window).apply(_rolling_max_drawdown, raw=True)
+    mdd.columns = [f"{c}_mdd{spec.mdd_window}" for c in SECTORS]
+    feats_wide[f"mdd{spec.mdd_window}"] = mdd
 
     for w in spec.semi_windows:
-        semi = logret_s.rolling(w, min_periods=w).apply(_rolling_downside_semivol, raw=True)
-        semi.columns = [f"{c}_semi{w}" for c in semi.columns]
+        semi = np.sqrt((logret_s.clip(upper=0) ** 2).rolling(w, min_periods=w).mean())
+        semi.columns = [f"{c}_semi{w}" for c in SECTORS]
         feats_wide[f"semi{w}"] = semi
 
-    features = []
-    for group_df in feats_wide.values():
-        features.append(group_df)
-
-    all_wide = pd.concat(features, axis=1)
-
+    all_wide = pd.concat(feats_wide.values(), axis=1)
     all_wide.index = dates
     all_wide.index.name = "Date"
 
     feat_long = all_wide.reset_index().melt(id_vars=["Date"], var_name="key", value_name="value")
     feat_long[["Sector", "Feature"]] = feat_long["key"].str.split("_", n=1, expand=True)
-    feat_long = feat_long.drop(columns=["key"])
-    feat_long = feat_long.pivot_table(index=["Date", "Sector"], columns="Feature", values="value", aggfunc="last")
-    feat_long = feat_long.reset_index()
+    feat_long = feat_long.pivot_table(
+        index=["Date", "Sector"], columns="Feature", values="value", aggfunc="last"
+    ).reset_index()
 
-    out = feat_long
-
+    rank_suffixes = (
+        tuple(f"relmom{L}" for L in spec.relmom_lookbacks)
+        + (f"mdd{spec.mdd_window}", f"beta{spec.beta_windows[0]}", f"idio_vol{spec.idio_window}")
+    )
     rank_candidates = [
-        c
-        for c in out.columns
-        if any(
-            c.endswith(s)
-            for s in (
-                f"relmom{spec.relmom_lookbacks[0]}",
-                f"relmom{spec.relmom_lookbacks[1]}",
-                f"relmom{spec.relmom_lookbacks[2]}",
-                f"mdd{spec.mdd_window}",
-                f"beta{spec.beta_windows[0]}",
-                f"idio_vol{spec.idio_window}",
-            )
-        )
-        or ("ratio_z" in c and any(str(w) in c for w in spec.ratio_z_windows))
+        c for c in feat_long.columns
+        if c.endswith(rank_suffixes) or ("ratio_z" in c and any(str(w) in c for w in spec.ratio_z_windows))
     ]
-    out = _cross_sectional_ranks(out, sorted(set(rank_candidates)))
-
-    out = out.sort_values(["Date", "Sector"]).reset_index(drop=True)
-    return out
+    feat_long = _cross_sectional_ranks(feat_long, sorted(set(rank_candidates)))
+    return feat_long.sort_values(["Date", "Sector"]).reset_index(drop=True)
 
 
 def main() -> None:

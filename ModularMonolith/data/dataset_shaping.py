@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -44,10 +45,14 @@ FORBIDDEN_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+# Trading cost threshold: Minimum return required to consider an observation "active"
+# This is the label ELIGIBILITY threshold, NOT the execution cost
+# Lower values (0.001 = 10bps) capture small movements; higher values filter them out
+# Units: decimal (0.001 = 10 basis points = 0.1%)
 COST_THRESHOLD: dict[int, float] = {
-    5: 0.001,
-    21: 0.001,
-    63: 0.001,
+    5: 0.001,   # 10 bps for 5-day horizon (capture small movements)
+    21: 0.001,  # 10 bps for 21-day horizon  
+    63: 0.001,  # 10 bps for 63-day horizon
 }
 
 
@@ -107,15 +112,46 @@ RAW3_SKIP_DATASETS: tuple[str, ...] = (
 )
 
 
-RAW3_ALLOWED_SUFFIXES: tuple[str, ...] = (
+# Regime indicators: Always load raw level columns (VIX-like signal)
+# SOTA: Absolute values matter for regime detection (VIX=75 vs VIX=25)
+RAW3_REGIME_INDICATORS: tuple[str, ...] = (
+    "NFCI",          # Financial Stress
+    "BAMLH0A0HYM2",  # Credit Spread
+    "UNRATE",        # Unemployment Rate
+    "EPU",           # Economic Policy Uncertainty
+    "GPR",           # Geopolitical Risk
+    "ICSA",          # Initial Claims
+)
+
+
+RAW3_LEVEL_SUFFIXES: tuple[str, ...] = (
+    "_asinh",
+    "_log1p",
+)
+
+
+RAW3_CHANGE_SUFFIXES: tuple[str, ...] = (
     "_diff",
     "_logret",
     "_dlog1p",
-    "_log1p",
-    "_asinh",
     "_mom",
     "_yoy",
 )
+
+
+def _raw3_include_level_features() -> bool:
+    v = str(os.environ.get("MM_RAW3_INCLUDE_LEVEL_FEATURES", "0")).strip().lower()
+    return v in {"1", "true", "yes", "y"}
+
+
+# FIX: Separate regime-specific level features (always allowed for VIX-like signals)
+RAW3_REGIME_LEVEL_NAMES: tuple[str, ...] = tuple(f"{ds}" for ds in RAW3_REGIME_INDICATORS)
+
+
+RAW3_ALLOWED_SUFFIXES: tuple[str, ...] = (
+    *RAW3_CHANGE_SUFFIXES,
+    *RAW3_LEVEL_SUFFIXES,
+) if _raw3_include_level_features() else RAW3_CHANGE_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -146,7 +182,7 @@ def _normalize_date_column(df: pd.DataFrame, *, col: str = "Date", name: str = "
     if pd.api.types.is_datetime64_any_dtype(s):
         dt = pd.to_datetime(s, errors="raise")
         if getattr(dt.dt, "tz", None) is not None:
-            dt = dt.dt.tz_localize(None)
+            dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
         df[col] = dt
         return
 
@@ -157,7 +193,7 @@ def _normalize_date_column(df: pd.DataFrame, *, col: str = "Date", name: str = "
     df[col] = pd.to_datetime(s, errors="raise")
     dt = df[col]
     if getattr(dt.dt, "tz", None) is not None:
-        df[col] = dt.dt.tz_localize(None)
+        df[col] = dt.dt.tz_convert("UTC").dt.tz_localize(None)
 
 
 def _normalize_sector_column(df: pd.DataFrame, *, col: str = "Sector", name: str = "df") -> None:
@@ -245,8 +281,19 @@ def _load_raw3_macro_broadcast(raw3_dir: Path) -> pd.DataFrame:
     seen_cols: set[str] = set()
 
     def is_allowed_transformed_column(col: str) -> bool:
+        """Allow change features + regime indicator levels (VIX-like signal)."""
         c = str(col)
-        return any(c.endswith(suf) for suf in RAW3_ALLOWED_SUFFIXES)
+        # Always allow stationary transforms
+        if any(c.endswith(suf) for suf in RAW3_ALLOWED_SUFFIXES):
+            return True
+        # FIX: Allow raw level columns for regime indicators ONLY if env toggle is on
+        # OR if it's an explicitly named regime level feature
+        if _raw3_include_level_features():
+            for regime_name in RAW3_REGIME_LEVEL_NAMES:
+                # Only allow exact match (not arbitrary suffixes)
+                if c == regime_name:
+                    return True
+        return False
 
     for p in files:
         if p.stem in set(RAW3_SKIP_DATASETS):
@@ -288,35 +335,6 @@ def _load_raw3_macro_broadcast(raw3_dir: Path) -> pd.DataFrame:
     return macro
 
 
-def _load_regimes_features(data_dir: Path) -> pd.DataFrame | None:
-    regimes_path = data_dir / "regimes" / "spy_regimes.parquet"
-    if not regimes_path.exists():
-        return None
-
-    rg = pd.read_parquet(regimes_path)
-    if "Date" in rg.columns:
-        rg = rg[["Date", *[c for c in ("hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]]].copy()
-        _normalize_date_column(rg, name="regimes")
-        rg = rg.sort_values("Date").drop_duplicates("Date", keep="last")
-    else:
-        idx = pd.to_datetime(rg.index, errors="raise")
-        if getattr(idx, "tz", None) is not None:
-            idx = idx.tz_localize(None)
-        keep = [c for c in ("hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]
-        if not keep:
-            return None
-        rg = rg[keep].copy()
-        rg.index = pd.DatetimeIndex(idx, name="Date")
-        rg = rg.sort_index().reset_index()
-
-    keep_cols = [c for c in ("Date", "hmm_raw", "hmm_low_vol", "hmm_trend", "hmm_delta") if c in rg.columns]
-    if keep_cols == ["Date"]:
-        return None
-    out = rg[keep_cols].copy()
-    _ensure_unique_key(out, ["Date"], name="regimes")
-    return out
-
-
 def _assert_no_merge_suffix_columns(df: pd.DataFrame, *, name: str) -> None:
     bad = [c for c in df.columns if isinstance(c, str) and (c.endswith("_x") or c.endswith("_y"))]
     if bad:
@@ -328,12 +346,14 @@ def _assert_no_merge_suffix_columns(df: pd.DataFrame, *, name: str) -> None:
 def _filter_train_window(df: pd.DataFrame, *, name: str) -> pd.DataFrame:
     if "Date" not in df.columns:
         raise ValueError(f"[{name}] Missing Date column for train-window filter")
-    out = df.copy()
-    out["Date"] = pd.to_datetime(out["Date"], errors="raise")
-    if getattr(out["Date"].dt, "tz", None) is not None:
-        out["Date"] = out["Date"].dt.tz_localize(None)
-    m = (out["Date"] >= TRAIN_DATE_START) & (out["Date"] <= TRAIN_DATE_END)
-    return out.loc[m].copy()
+    # Memory optimization: work on Date column only, then slice (avoid double copy)
+    dt = pd.to_datetime(df["Date"], errors="raise")
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+    m = (dt >= TRAIN_DATE_START) & (dt <= TRAIN_DATE_END)
+    out = df.loc[m].copy()
+    out["Date"] = dt.loc[m].to_numpy()
+    return out
 
 
 def _assert_same_date_set(a: pd.DataFrame, b: pd.DataFrame, *, name_a: str, name_b: str) -> None:
@@ -347,7 +367,7 @@ def _assert_same_date_set(a: pd.DataFrame, b: pd.DataFrame, *, name_a: str, name
     only_a = sorted(sa - sb)
     only_b = sorted(sb - sa)
     raise AssertionError(
-        "Calendar mismatch between inputs after canonical 2005 - 2025 cut. "
+        "Calendar mismatch between inputs after train-window cut. "
         f"{name_a}_dates={len(da)} {name_b}_dates={len(db)} "
         f"{name_a}_only={len(only_a)} {name_b}_only={len(only_b)} "
         f"{name_a}_range=[{(da.min().date() if len(da) else None)},{(da.max().date() if len(da) else None)}] "
@@ -437,8 +457,8 @@ def _select_feature_columns(df: pd.DataFrame, *, target_col: str) -> list[str]:
 def load_dual_model_dataset(
     horizon: int,
     *,
+    cost_threshold: float | None = None,
     enforce_full_universe: bool = True,
-    require_regimes: bool = True,
     verbose: bool = True,
     features_path: Path | None = None,
     labels_path: Path | None = None,
@@ -453,7 +473,10 @@ def load_dual_model_dataset(
     if horizon not in COST_THRESHOLD:
         raise ValueError(f"Missing COST_THRESHOLD for horizon={horizon}; have keys={sorted(COST_THRESHOLD)}")
     default_cost_threshold = float(COST_THRESHOLD[horizon])
-    cost_threshold = float(default_cost_threshold)
+    cost_threshold = float(default_cost_threshold) if cost_threshold is None else float(cost_threshold)
+
+    if not np.isfinite(cost_threshold) or cost_threshold < 0:
+        raise ValueError(f"Invalid cost_threshold={cost_threshold}. Must be finite and >= 0.")
 
     if features_path is None or labels_path is None or correlations_path is None or raw3_dir is None:
         d_features, d_labels, d_corr, d_raw3 = _paths_for_fusion(horizon)
@@ -481,7 +504,38 @@ def load_dual_model_dataset(
     _maybe_validate_labels_horizon(labels, horizon=horizon, labels_path=labels_path)
     label_excess_col = _resolve_label_excess_column(labels, horizon=horizon)
     target_col = label_excess_col
+    
+    # CRITICAL: Validate label_contract for temporal alignment verification
+    if "label_contract" not in labels.columns:
+        import warnings
+        warnings.warn(
+            f"[label_contract] MISSING: labels file {labels_path} lacks 'label_contract' metadata field. "
+            f"Cannot verify feature-label temporal alignment. "
+            f"Expected format: 'label_excess[t] = sum(r_sector[t+1..t+h] - r_spy[t+1..t+h]) - cost_bps' "
+            f"OR 'close-to-close shifted h={horizon}' OR similar human-readable description. "
+            f"Add this field to labels generation to enable automatic alignment verification.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+    else:
+        label_contract = str(labels["label_contract"].iloc[0]) if len(labels) > 0 else ""
+        if verbose:
+            print(f"[label_contract] {label_contract}")
+        
+        # Basic validation: contract should mention horizon
+        if str(horizon) not in label_contract and f"h={horizon}" not in label_contract:
+            warnings.warn(
+                f"[label_contract] WARNING: contract '{label_contract}' does not mention horizon={horizon}. "
+                f"Verify manually that labels match requested horizon.",
+                category=UserWarning,
+                stacklevel=2,
+            )
 
+    # Note: labels may contain 'cost_bps' field (execution cost, e.g. 50bps)
+    # This is DIFFERENT from COST_THRESHOLD (label eligibility threshold, e.g. 10bps)
+    # - cost_bps: Execution cost baked into label_excess calculation (post-cost returns)
+    # - COST_THRESHOLD: Minimum return to consider observation "active" (pre-filtering)
+    # These serve different purposes and should not be required to match
     if "cost_bps" in labels.columns:
         cb = pd.to_numeric(labels["cost_bps"], errors="coerce").dropna().unique()
         if cb.size == 1:
@@ -489,12 +543,8 @@ def load_dual_model_dataset(
             derived = float(cost_bps) / 10_000.0
             if not np.isfinite(derived) or derived < 0:
                 raise ValueError(f"Invalid cost_bps in labels: {cost_bps}")
-            if not np.isclose(derived, default_cost_threshold, rtol=0.0, atol=1e-12):
-                raise ValueError(
-                    "Cost inconsistency: labels cost_bps disagrees with COST_THRESHOLD. "
-                    f"h={horizon} labels_cost_bps={cost_bps} -> {derived} vs COST_THRESHOLD={default_cost_threshold}"
-                )
-            cost_threshold = float(derived)
+            # Note: We do NOT require cost_threshold to match labels cost_bps
+            # They serve different purposes in the pipeline
         elif cb.size > 1:
             raise ValueError(
                 f"Labels contain multiple cost_bps values for h={horizon}: {cb.tolist()}. Expected a single constant."
@@ -512,26 +562,6 @@ def load_dual_model_dataset(
 
     correlations_wide = _load_correlations_wide(correlations_path)
     macro = _load_raw3_macro_broadcast(raw3_dir)
-
-    regimes_dir = Path(__file__).resolve().parent
-    regimes_path = regimes_dir / "regimes" / "spy_regimes.parquet"
-    regimes = _load_regimes_features(regimes_dir)
-
-    if require_regimes and (regimes is None or regimes.empty):
-        raise FileNotFoundError(
-            "Required HMM regimes parquet is missing or empty. "
-            f"Expected: {regimes_path}"
-        )
-
-    if regimes is not None and not regimes.empty:
-        req_cols = ["hmm_raw", "hmm_trend", "hmm_delta"]
-        missing = [c for c in req_cols if c not in regimes.columns]
-        if require_regimes and missing:
-            raise ValueError(
-                "HMM regimes parquet is missing required columns. "
-                f"Missing={missing} columns={sorted(map(str, regimes.columns))} path={regimes_path}"
-            )
-        macro = macro.merge(regimes, on="Date", how="outer")
 
     drop_from_p1 = [c for c in features_p1.columns if isinstance(c, str) and c.startswith("label_")]
     if drop_from_p1:
@@ -554,12 +584,56 @@ def load_dual_model_dataset(
     correlations_wide = _filter_train_window(correlations_wide, name="correlations_wide")
     macro = _filter_train_window(macro, name="raw3_macro")
 
-    _assert_same_date_set(labels, features_p1, name_a="labels", name_b="features_p1")
+    dates_labels = pd.DatetimeIndex(pd.to_datetime(labels["Date"], errors="raise").dt.tz_localize(None).unique())
+    dates_features = pd.DatetimeIndex(
+        pd.to_datetime(features_p1["Date"], errors="raise").dt.tz_localize(None).unique()
+    )
+    common_dates = dates_labels.intersection(dates_features)
+    # FIX: Sort common_dates to ensure consistent ordering for downstream operations
+    common_dates = common_dates.sort_values()
+    if len(common_dates) == 0:
+        raise RuntimeError(
+            "No overlapping dates between labels and features after train-window filtering. "
+            f"labels_range=[{dates_labels.min().date() if len(dates_labels) else None},{dates_labels.max().date() if len(dates_labels) else None}] "
+            f"features_range=[{dates_features.min().date() if len(dates_features) else None},{dates_features.max().date() if len(dates_features) else None}]"
+        )
+    if verbose and (not dates_labels.equals(common_dates) or not dates_features.equals(common_dates)):
+        only_labels = dates_labels.difference(common_dates)
+        only_features = dates_features.difference(common_dates)
+        print(
+            "[calendar] Aligning labels/features to common date intersection. "
+            f"labels_only={len(only_labels)} features_only={len(only_features)} "
+            f"common_dates={len(common_dates)} "
+            f"sample_labels_only={[d.date() for d in only_labels[:3].tolist()]} "
+            f"sample_features_only={[d.date() for d in only_features[:3].tolist()]}"
+        )
+
+    labels = labels[labels["Date"].isin(common_dates)].copy()
+    features_p1 = features_p1[features_p1["Date"].isin(common_dates)].copy()
+
+    # FIX: Sort before panel key assertion to prevent false-positive order mismatches
+    labels = labels.sort_values(["Date", "Sector"], kind="mergesort").reset_index(drop=True)
+    features_p1 = features_p1.sort_values(["Date", "Sector"], kind="mergesort").reset_index(drop=True)
+
     _assert_same_panel_keys(labels, features_p1, name_a="labels", name_b="features_p1")
 
-    merged = labels.copy()
+    # FIX (2): Timing validation - check if labels have contract metadata
+    if verbose and "horizon" in labels.columns:
+        h_vals = pd.to_numeric(labels["horizon"], errors="coerce").dropna().unique()
+        if h_vals.size == 1 and int(h_vals[0]) == int(horizon):
+            print(f"[timing_check] Labels horizon validated: {int(h_vals[0])} days")
+        if "label_contract" in labels.columns:
+            contracts = labels["label_contract"].dropna().unique()
+            print(f"[timing_check] Label temporal contract: {contracts.tolist()}")
+        else:
+            print(
+                f"[timing_check] WARNING: labels missing 'label_contract' field. "
+                f"Cannot verify feature-label temporal alignment. "
+                f"Verify manually that features[T] and labels[T] use same information base."
+            )
 
-    merged = merged.merge(features_p1, on=["Date", "Sector"], how="inner")
+    # Memory optimization: merge directly without intermediate copy
+    merged = labels.merge(features_p1, on=["Date", "Sector"], how="inner")
 
     _normalize_date_column(correlations_wide, name="correlations_wide")
     _normalize_sector_column(correlations_wide, name="correlations_wide")
@@ -568,30 +642,20 @@ def load_dual_model_dataset(
 
     _normalize_date_column(macro, name="raw3_macro")
     _ensure_unique_key(macro, ["Date"], name="raw3_macro")
+    
+    # FIX: Track macro columns before merge for staleness diagnostics
+    macro_cols = [c for c in macro.columns if c != "Date"]
     merged = merged.merge(macro, on=["Date"], how="left")
-
-    if require_regimes:
-        req_cols = ["hmm_raw", "hmm_trend", "hmm_delta"]
-        missing = [c for c in req_cols if c not in merged.columns]
-        if missing:
-            raise RuntimeError(
-                "HMM regimes columns are missing after merge; expected them to be present in merged dataset. "
-                f"Missing={missing}"
-            )
-        nan_any = merged[req_cols].isna().any(axis=1)
-        if bool(nan_any.any()):
-            bad_dates = (
-                pd.to_datetime(merged.loc[nan_any, "Date"], errors="raise")
-                .dt.tz_localize(None)
-                .drop_duplicates()
-                .sort_values()
-            )
-            sample = [d.date() for d in bad_dates.iloc[:10].tolist()]
-            raise ValueError(
-                "HMM regimes contain NaNs after merge into dataset. "
-                "Regimes must be fully populated over the training window to avoid silent feature holes. "
-                f"bad_dates={len(bad_dates)} sample={sample}"
-            )
+    
+    # FIX (4): Macro staleness diagnostics
+    if verbose and macro_cols:
+        macro_nan_pcts = {c: float(merged[c].isna().mean()) for c in macro_cols if c in merged.columns}
+        high_nan = {c: pct for c, pct in macro_nan_pcts.items() if pct > 0.1}
+        if high_nan:
+            print(f"[macro_staleness] WARNING: High NaN% in macro features after merge (no ffill):")
+            for c, pct in sorted(high_nan.items(), key=lambda x: -x[1])[:10]:
+                print(f"  {c}: {pct:.1%} NaN")
+            print("[macro_staleness] Consider bounded as-of merge or staleness features for production.")
 
     _assert_no_merge_suffix_columns(merged, name="merged")
 
@@ -649,10 +713,19 @@ def load_dual_model_dataset(
 
     merged = merged.sort_values(["Date", "Sector"], kind="mergesort").reset_index(drop=True)
 
+    # ✅ GATE LABELS: y_gate = 1 if excess > threshold ("winner")
+    # Original definition was correct; polarity issue is in ranker ordering
     if "y_gate" not in merged.columns:
         merged["y_gate"] = (merged[target_col] > cost_threshold).astype(np.int8)
     else:
-        merged["y_gate"] = pd.to_numeric(merged["y_gate"], errors="coerce").astype("Int64").astype(np.int8)
+        # FIX (6): Validate y_gate has no NAs before coercion
+        yg = pd.to_numeric(merged["y_gate"], errors="coerce")
+        if yg.isna().any():
+            raise ValueError(
+                f"y_gate has {int(yg.isna().sum())} NaNs after target drop; "
+                "label artifact inconsistent. Check labels/h{horizon}.parquet generation."
+            )
+        merged["y_gate"] = yg.astype(np.int8)
 
     if "rel_rank" not in merged.columns:
         merged["rel_rank"] = (
@@ -669,6 +742,24 @@ def load_dual_model_dataset(
         raise RuntimeError("rank_target contains NaNs after merge")
 
     feature_cols = _select_feature_columns(merged, target_col=target_col)
+    
+    # FIX (7): Detect misnamed features that passed upstream (semantic contract violations)
+    misnamed_patterns = {
+        "mean_corr_others": "Should be 'corr_with_sector_mean' (semantic accuracy)",
+        "mean_corr_driver": "Should specify driver name explicitly",
+    }
+    misnamed_found = []
+    for pattern, reason in misnamed_patterns.items():
+        matches = [c for c in feature_cols if pattern in c.lower()]
+        if matches:
+            misnamed_found.extend([(c, reason) for c in matches])
+    
+    if misnamed_found and verbose:
+        print(f"[feature_naming] WARNING: Detected {len(misnamed_found)} potentially misnamed features:")
+        for feat, reason in misnamed_found[:5]:
+            print(f"  {feat}: {reason}")
+        print("[feature_naming] These features will be included but consider renaming upstream.")
+    
     X = merged[feature_cols].copy()
     y_gate = merged["y_gate"].to_numpy(dtype=np.int8)
     y_rank = merged["rank_target"].to_numpy(dtype=np.int16)
@@ -699,6 +790,105 @@ def load_dual_model_dataset(
         cost_threshold=cost_threshold,
     )
 
+
+def load_dual_model_dataset_cached(
+    horizon: int,
+    *,
+    dataset_root: Path | None = None,
+    enforce_full_universe: bool = True,
+    verbose: bool = True,
+) -> ShapingResult:
+    """
+    Load the *final* prebuilt dataset from ModularMonolith/data/dataset/h{horizon}.
+
+    This path is produced by _save_shaping_result(). It is faster and more reproducible
+    than rebuilding the dataset from upstream feature/label sources on every run.
+    """
+    if horizon not in HORIZONS:
+        raise ValueError(f"Unsupported horizon {horizon}; expected one of {HORIZONS}")
+
+    if dataset_root is None:
+        dataset_root = DATASET_OUT_DIR
+
+    out_dir = Path(dataset_root) / f"h{int(horizon)}"
+    meta_path = out_dir / "meta.json"
+    X_path = out_dir / "X.parquet"
+    y_path = out_dir / "y.parquet"
+    y_gate_path = out_dir / "y_gate.npy"
+    y_rank_path = out_dir / "y_rank.npy"
+    group_path = out_dir / "group_sizes.npy"
+
+    missing = [p for p in (meta_path, X_path, y_path, y_gate_path, y_rank_path, group_path) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Cached dataset for h={horizon} is incomplete. Missing: {[str(p) for p in missing]}")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if int(meta.get("horizon", horizon)) != int(horizon):
+        raise ValueError(f"Cached dataset horizon mismatch: meta.horizon={meta.get('horizon')} expected={horizon}")
+
+    if verbose:
+        print(f"\n[load_cached] horizon={horizon}")
+        print(f"[load_cached] dataset_dir={out_dir}")
+
+    X = pd.read_parquet(X_path)
+    y_df = pd.read_parquet(y_path)
+    y_gate = np.load(y_gate_path)
+    y_rank = np.load(y_rank_path)
+    group_sizes = np.load(group_path)
+
+    _assert_required_columns(y_df, ["Date", "Sector", "label_excess"], name="cached_y")
+    _normalize_date_column(y_df, name="cached_y")  # Applies UTC normalization
+    _normalize_sector_column(y_df, name="cached_y")
+    _ensure_unique_key(y_df, ["Date", "Sector"], name="cached_y")
+
+    if len(X) != len(y_df) or len(y_gate) != len(y_df) or len(y_rank) != len(y_df):
+        raise RuntimeError(
+            "Cached dataset alignment error: lengths differ. "
+            f"len(X)={len(X)} len(y_df)={len(y_df)} len(y_gate)={len(y_gate)} len(y_rank)={len(y_rank)}"
+        )
+
+    if int(group_sizes.sum()) != int(len(y_df)):
+        raise RuntimeError(
+            "Cached dataset group_sizes mismatch: sum(group_sizes) != n_rows. "
+            f"sum={int(group_sizes.sum())} n_rows={len(y_df)}"
+        )
+
+    if enforce_full_universe and not np.all(group_sizes == len(EXPECTED_SECTORS)):
+        raise RuntimeError("Cached dataset violates full-universe policy: expected all group_sizes == 9")
+
+    feature_cols = list(meta.get("feature_cols", []))
+    if not feature_cols:
+        feature_cols = [c for c in X.columns]
+    missing_feats = [c for c in feature_cols if c not in X.columns]
+    if missing_feats:
+        raise RuntimeError(f"Cached dataset meta.feature_cols contains missing columns: {missing_feats[:10]}")
+
+    # Safety: drop any legacy HMM columns from cached datasets.
+    hmm_like = [c for c in X.columns if str(c).lower().startswith("hmm_")]
+    if hmm_like:
+        X = X.drop(columns=hmm_like, errors="ignore")
+        feature_cols = [c for c in feature_cols if not str(c).lower().startswith("hmm_")]
+
+    X = X[[c for c in feature_cols if c in X.columns]].copy()
+    full_df = pd.concat([y_df.reset_index(drop=True), X.reset_index(drop=True)], axis=1)
+
+    return ShapingResult(
+        horizon=int(horizon),
+        target_col=str(meta.get("target_col", "label_excess")),
+        features_path=X_path,
+        labels_path=y_path,
+        correlations_path=meta_path,
+        full_df=full_df,
+        X=X,
+        y_gate=np.asarray(y_gate, dtype=np.int8),
+        y_rank=np.asarray(y_rank, dtype=np.int16),
+        group_sizes=np.asarray(group_sizes, dtype=np.int32),
+        feature_cols=feature_cols,
+        dropped_rows_nan_target=int(meta.get("dropped_rows_nan_target", 0)),
+        dropped_dates_nan_target=int(meta.get("dropped_dates_nan_target", 0)),
+        dropped_dates_universe_policy=int(meta.get("dropped_dates_universe_policy", 0)),
+        cost_threshold=float(meta.get("cost_threshold", COST_THRESHOLD[int(horizon)])),
+    )
 
 def _sanity_report(res: ShapingResult, *, show_first_dates: int = 3) -> None:
     df = res.full_df

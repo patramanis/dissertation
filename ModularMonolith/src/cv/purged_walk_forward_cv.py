@@ -24,18 +24,45 @@ class FoldInfo:
 
 
 class PurgedWalkForwardCV(BaseCrossValidator):
+    """
+    EXPANDING-ONLY Walk-Forward CV with Date-based Purging.
+    
+    Design:
+    - Train window GROWS monotonically (never shrinks).
+    - Train is ALWAYS chronologically before Test (no overlap, no Swiss cheese).
+    - Embargo is NOT supported (enforce_expanding_only=True raises if embargo>0).
+    - For Rolling Window or K-Fold with embargo, use a different CV class.
+    
+    Purging:
+    - Index-based on unique trading dates (assumes daily calendar with no gaps).
+    - purge_gap should match label horizon h for contract Return(T-1 → T-1+h).
+    
+    Performance:
+    - O(N) indexing per fold via factorized group codes (not O(N×G) isin).
+    - Suitable for large panel datasets (Date×Sector with N~50k rows).
+    """
 
     def __init__(
         self,
         *,
-        n_splits: int = 5,
+        n_splits: int | None = 5,
         test_size: int = 63,
         purge_gap: int = 21,
         min_train_size: int = 252,
         embargo: int = 0,
+        test_start: object | None = None,
+        enforce_expanding_only: bool = True,
     ) -> None:
-        if n_splits <= 0:
-            raise ValueError("n_splits must be positive")
+        """
+        CRITICAL ASSUMPTIONS:
+        1. EXPANDING WINDOW ONLY: embargo must be 0 (Train grows monotonically and is always before Test).
+           For K-Fold or Rolling Window with embargo, use a different CV class.
+        2. Purge gap is INDEX-based on unique trading dates (not timedelta-based).
+           Safe for Daily trading calendar. RISKY for intraday or sparse data.
+        3. Groups must be Date (one per sample) with repeats for panel data (e.g., Date×Sector).
+        """
+        if n_splits is not None and n_splits <= 0:
+            raise ValueError("n_splits must be positive (or None for dynamic)")
         if test_size <= 0:
             raise ValueError("test_size must be positive")
         if purge_gap < 0:
@@ -44,15 +71,62 @@ class PurgedWalkForwardCV(BaseCrossValidator):
             raise ValueError("min_train_size must be positive")
         if embargo < 0:
             raise ValueError("embargo must be >= 0")
+        
+        # FIX (1): Enforce embargo=0 for expanding-only design (no "fake safety")
+        if enforce_expanding_only and embargo != 0:
+            raise ValueError(
+                f"This CV is EXPANDING-ONLY: embargo must be 0 (got embargo={embargo}). "
+                "Expanding Window means Train is ALWAYS chronologically before Test, "
+                "so embargo (which excludes dates immediately after Test from Train) has no effect. "
+                "If you need embargo>0, use a Rolling Window or K-Fold CV class instead."
+            )
 
-        self.n_splits = int(n_splits)
+        self.n_splits = int(n_splits) if n_splits is not None else None
         self.test_size = int(test_size)
         self.purge_gap = int(purge_gap)
         self.min_train_size = int(min_train_size)
         self.embargo = int(embargo)
+        self.test_start = test_start
 
     def get_n_splits(self, X=None, y=None, groups=None) -> int:
-        return self.n_splits
+        if self.n_splits is not None:
+            return self.n_splits
+        if groups is None:
+            raise ValueError("groups is required to compute dynamic n_splits")
+        groups_1d = self._as_1d_array(groups)
+        unique_groups = self._unique_sorted(groups_1d)
+        n_groups = int(unique_groups.shape[0])
+        first_test_start = self._resolve_first_test_start(unique_groups)
+        remaining = max(0, n_groups - first_test_start)
+        return int((remaining + self.test_size - 1) // self.test_size)
+
+    def _resolve_first_test_start(self, unique_groups: np.ndarray) -> int:
+        n_groups = int(unique_groups.shape[0])
+        if self.test_start is None:
+            if self.n_splits is None:
+                raise ValueError("n_splits cannot be None when test_start is None")
+            return n_groups - (int(self.n_splits) * self.test_size)
+
+        ts = self.test_start
+        if np.issubdtype(unique_groups.dtype, np.datetime64):
+            try:
+                import pandas as pd
+
+                ts = np.datetime64(pd.Timestamp(ts).to_datetime64())
+            except Exception:
+                ts = np.asarray(ts, dtype=unique_groups.dtype).item()
+        else:
+            try:
+                ts = np.asarray(ts, dtype=unique_groups.dtype).item()
+            except Exception:
+                ts = ts
+
+        i = int(np.searchsorted(unique_groups, ts, side="left"))
+        if i < 0:
+            i = 0
+        if i > n_groups:
+            i = n_groups
+        return i
 
     @staticmethod
     def _as_1d_array(groups) -> np.ndarray:
@@ -61,6 +135,19 @@ class PurgedWalkForwardCV(BaseCrossValidator):
         g = np.asarray(groups)
         if g.ndim != 1:
             g = np.ravel(g)
+        
+        # FIX (3): Normalize object dtype (e.g., pd.Timestamp) to datetime64[ns]
+        # This prevents sort/comparison failures with mixed types
+        if g.dtype == object or str(g.dtype).startswith("datetime"):
+            try:
+                import pandas as pd
+                g = pd.to_datetime(g, errors="raise").to_numpy(dtype="datetime64[ns]")
+            except Exception as e:
+                raise ValueError(
+                    f"groups contains non-datetime or incompatible types. "
+                    f"Expected datetime-like array, got dtype={g.dtype}"
+                ) from e
+        
         return g
 
     @staticmethod
@@ -81,46 +168,58 @@ class PurgedWalkForwardCV(BaseCrossValidator):
         unique_groups = self._unique_sorted(groups_1d)
         n_groups = unique_groups.shape[0]
 
-        required = self.n_splits * self.test_size + self.purge_gap + self.min_train_size
-        if self.embargo > 0:
-            required += (self.n_splits - 1) * self.embargo
-        if n_groups < required:
+        first_test_start = self._resolve_first_test_start(unique_groups)
+        if int(first_test_start) >= int(n_groups):
             raise ValueError(
-                f"Not enough unique groups for n_splits*test_size+purge_gap+min_train_size"
-                f"{' (+conservative cumulative embargo bound)' if self.embargo > 0 else ''}: "
-                f"have {n_groups}, need {required}"
+                "test_start is after the last available group/date. "
+                f"test_start={self.test_start} last_group={unique_groups[-1] if int(n_groups) else None}"
             )
 
-        first_test_start = n_groups - (self.n_splits * self.test_size)
-        embargoed_groups: set[object] = set()
+        max_by_data = int((int(n_groups) - int(first_test_start) + self.test_size - 1) // self.test_size)
+        effective_splits = max_by_data if self.n_splits is None else min(int(self.n_splits), max_by_data)
+        if effective_splits <= 0:
+            raise ValueError("No feasible splits: not enough groups after test_start")
 
-        for i in range(self.n_splits):
+        # FIX (6): Remove embargo from required check (it's not applied in expanding window)
+        required = effective_splits * self.test_size + self.purge_gap + self.min_train_size
+        if n_groups < required and self.test_start is None:
+            raise ValueError(
+                f"Not enough unique groups for n_splits*test_size+purge_gap+min_train_size: "
+                f"have {n_groups}, need {required}"
+            )
+        
+        # FIX (4): Factorize groups_1d to integer codes for O(N) performance (not O(N×G))
+        # Map each sample → group_code (0..n_groups-1)
+        group_codes = np.searchsorted(unique_groups, groups_1d)
+        if not np.all((group_codes >= 0) & (group_codes < n_groups)):
+            raise ValueError("groups_1d contains values not in unique_groups (corrupted data)")
+
+        for i in range(effective_splits):
             test_start_idx = first_test_start + i * self.test_size
             test_end_idx = test_start_idx + self.test_size
+
+            if int(test_start_idx) >= int(n_groups):
+                break
+            test_end_idx = min(int(test_end_idx), int(n_groups))
 
             test_groups = unique_groups[test_start_idx:test_end_idx]
             if test_groups.size == 0:
                 raise RuntimeError("Empty test window; check n_splits/test_size")
 
+            # Index-based purging assumes uniform date spacing (trading days).
+            # For label contract Return(T-1 → T-1+h), purge_gap should be == h (not h+1).
             train_end_idx = max(0, test_start_idx - self.purge_gap)
             train_groups = unique_groups[:train_end_idx]
-
-            if embargoed_groups:
-                embargoed_arr = np.fromiter(
-                    embargoed_groups,
-                    dtype=unique_groups.dtype,
-                    count=len(embargoed_groups),
-                )
-                train_groups = train_groups[~np.isin(train_groups, embargoed_arr)]
 
             if train_groups.size < self.min_train_size:
                 raise RuntimeError(
                     f"Split {i}: train_groups.size={int(train_groups.size)} < min_train_size={self.min_train_size}. "
-                    f"n_groups={int(n_groups)}, purge_gap={self.purge_gap}, embargo={self.embargo}"
+                    f"n_groups={int(n_groups)}, purge_gap={self.purge_gap}"
                 )
 
-            train_mask = np.isin(groups_1d, train_groups)
-            test_mask = np.isin(groups_1d, test_groups)
+            # FIX (4): Use factorized group_codes for O(N) indexing (not O(N×G) isin)
+            train_mask = group_codes < train_end_idx
+            test_mask = (group_codes >= test_start_idx) & (group_codes < test_end_idx)
 
             train_index = np.flatnonzero(train_mask)
             test_index = np.flatnonzero(test_mask)
@@ -130,6 +229,22 @@ class PurgedWalkForwardCV(BaseCrossValidator):
                     f"Split {i}: Training set is empty. "
                     f"Too many splits ({self.n_splits}) or purge_gap ({self.purge_gap}) is too large for the dataset size."
                 )
+            
+            # FIX (7): Correctness asserts to catch data corruption early
+            overlap = np.intersect1d(train_index, test_index)
+            if overlap.size > 0:
+                raise RuntimeError(
+                    f"Split {i}: Train/Test overlap detected ({overlap.size} samples). "
+                    "This indicates a bug in the CV logic or corrupted groups data."
+                )
+            
+            # Expanding window: Train must be chronologically before Test
+            if train_groups.size > 0 and test_groups.size > 0:
+                if train_groups[-1] >= test_groups[0]:
+                    raise RuntimeError(
+                        f"Split {i}: Train end ({train_groups[-1]}) >= Test start ({test_groups[0]}). "
+                        f"Expanding window violated. purge_gap={self.purge_gap} may be too small."
+                    )
 
             info: FoldInfo | None = None
             if want_info:
@@ -143,11 +258,16 @@ class PurgedWalkForwardCV(BaseCrossValidator):
                     embargo=self.embargo,
                 )
 
-            if self.embargo > 0:
-                emb_start = test_end_idx
-                emb_end = min(n_groups, test_end_idx + self.embargo)
-                embargoed = unique_groups[emb_start:emb_end]
-                embargoed_groups.update(embargoed.tolist())
+            # REMOVED: Cumulative embargo persistence (Swiss Cheese bug)
+            # Old code:
+            # if self.embargo > 0:
+            #     emb_start = test_end_idx
+            #     emb_end = min(n_groups, test_end_idx + self.embargo)
+            #     embargoed = unique_groups[emb_start:emb_end]
+            #     embargoed_groups.update(embargoed.tolist())
+            # 
+            # This created permanent "holes" in the training set for all future splits.
+            # In Expanding Window, Train[t] ⊂ Train[t+1], so past embargos should NOT persist.
 
             yield train_index, test_index, info
 
@@ -179,6 +299,7 @@ def plot_cv_indices(
     import matplotlib.dates as mdates
 
     if ax is None:
+        # FIX (5): Pass groups to get_n_splits (required if n_splits=None)
         _, ax = plt.subplots(figsize=(12, 1 + 0.6 * cv.get_n_splits(X, y, groups)))
 
     n_samples = len(X)
@@ -214,8 +335,10 @@ def plot_cv_indices(
             linewidths=3,
         )
 
-    ax.set_yticks(np.arange(cv.get_n_splits(X, y, groups)))
-    ax.set_yticklabels([f"split {i}" for i in range(cv.get_n_splits(X, y, groups))])
+    # FIX (5): Pass groups consistently
+    n_splits_val = cv.get_n_splits(X, y, groups)
+    ax.set_yticks(np.arange(n_splits_val))
+    ax.set_yticklabels([f"split {i}" for i in range(n_splits_val)])
     ax.set_xlabel(x_label)
     ax.set_ylabel("CV split")
     if title is not None:
@@ -289,14 +412,14 @@ def plot_cv_price_panels(
     if len(unique_dates) != len(price):
         raise ValueError("unique_dates and price must have same length")
 
-    n_splits = cv.get_n_splits()
+    # FIX (5): Pass groups to get_n_splits
+    groups = unique_dates
+    X_dummy = np.zeros((len(groups), 1), dtype=float)
+    n_splits = cv.get_n_splits(X_dummy, None, groups)
     fig_h = max(6.0, 0.55 * n_splits)
     fig, axes = plt.subplots(n_splits, 1, figsize=(14, fig_h), sharex=True, constrained_layout=True)
     if n_splits == 1:
         axes = [axes]
-
-    groups = unique_dates
-    X_dummy = np.zeros((len(groups), 1), dtype=float)
 
     locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
     formatter = mdates.ConciseDateFormatter(locator)
@@ -353,11 +476,13 @@ if __name__ == "__main__":
         if not keys_path.exists():
             raise FileNotFoundError(keys_path)
 
-        groups = _load_groups_from_keys(keys_path)
-        unique_dates = np.unique(groups)
+        # FIX (8): Load full panel groups (Date with repeats for each Sector)
+        panel_groups = _load_groups_from_keys(keys_path)
+        unique_dates = np.unique(panel_groups)
         unique_dates = np.sort(unique_dates)
         price = _simulate_synthetic_price(unique_dates, seed=123 + int(h), start=100.0)
 
+        # FIX (2): purge_gap should match label contract (h for Return(T-1→T-1+h))
         purge_gap = int(h)
         test_size = 126 if h == 63 else 63
         n_splits = 10 if h == 63 else 20
@@ -367,13 +492,25 @@ if __name__ == "__main__":
             test_size=test_size,
             purge_gap=purge_gap,
             embargo=0,
+            enforce_expanding_only=True,
         )
+
+        # Validate CV correctness on panel data
+        print(f"\n[h={h}] Validating CV on panel data (n_samples={len(panel_groups)})...")
+        X_panel = np.zeros((len(panel_groups), 1), dtype=float)
+        for fold_i, (train_idx, test_idx) in enumerate(cv.split(X_panel, groups=panel_groups)):
+            train_dates = panel_groups[train_idx]
+            test_dates = panel_groups[test_idx]
+            if fold_i == 0:
+                print(f"  Fold {fold_i}: train_size={len(train_idx)} test_size={len(test_idx)}")
+                print(f"    train_dates: {np.min(train_dates)} to {np.max(train_dates)}")
+                print(f"    test_dates: {np.min(test_dates)} to {np.max(test_dates)}")
 
         out_path = out_dir / f"cv_h{h}.png"
 
         title = (
-            f"Purged Walk-Forward CV on synthetic price (h={h}) | "
-            f"folds={n_splits} | test_size={test_size} | purge_gap={purge_gap}"
+            f"Purged Walk-Forward CV (h={h}) | "
+            f"folds={n_splits} | test_size={test_size} | purge_gap={purge_gap} (expanding-only)"
         )
         fig = plot_cv_price_panels(cv=cv, unique_dates=unique_dates, price=price, title=title)
         fig.savefig(out_path, dpi=150, bbox_inches="tight")

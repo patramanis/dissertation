@@ -17,7 +17,20 @@ def _read_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"Missing Date column in {path}")
     df["Date"] = pd.to_datetime(df["Date"], errors="raise")
     df = df.sort_values("Date")
-    df = df.drop_duplicates(subset=["Date"], keep="last")
+    norm = df["Date"].dt.normalize()
+    dup_mask = norm.duplicated(keep=False)
+    if bool(dup_mask.any()):
+        dup_dates = (
+            norm.loc[dup_mask]
+            .value_counts()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+        examples = ", ".join([f"{d.date()}(x{int(c)})" for d, c in dup_dates.items()])
+        raise ValueError(
+            "Duplicate Date rows detected (refusing to silently drop). "
+            f"path={path} n_dup_rows={int(dup_mask.sum())} examples=[{examples}]"
+        )
     return df
 
 
@@ -27,7 +40,20 @@ def _read_parquet(path: Path) -> pd.DataFrame:
         raise ValueError(f"Missing Date column in {path}")
     df["Date"] = pd.to_datetime(df["Date"], errors="raise")
     df = df.sort_values("Date")
-    df = df.drop_duplicates(subset=["Date"], keep="last")
+    norm = df["Date"].dt.normalize()
+    dup_mask = norm.duplicated(keep=False)
+    if bool(dup_mask.any()):
+        dup_dates = (
+            norm.loc[dup_mask]
+            .value_counts()
+            .sort_values(ascending=False)
+            .head(10)
+        )
+        examples = ", ".join([f"{d.date()}(x{int(c)})" for d, c in dup_dates.items()])
+        raise ValueError(
+            "Duplicate Date rows detected (refusing to silently drop). "
+            f"path={path} n_dup_rows={int(dup_mask.sum())} examples=[{examples}]"
+        )
     return df
 
 

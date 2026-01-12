@@ -41,6 +41,93 @@ def _require_columns(df: pd.DataFrame, path: Path, cols: list[str]) -> None:
         raise KeyError(f"Missing columns in {path}: {missing}")
 
 
+def _verify_raw2_shift_semantics(mm_root: Path) -> dict[str, object]:
+    """CRITICAL: Verify raw2 shift semantics to prevent off-by-one in correlations."""
+    raw1_spdr = mm_root / "data" / "raw_data_1" / "SPDR.csv"
+    raw2_spdr = mm_root / "data" / "raw_data_2" / "SPDR.parquet"
+    
+    if not raw1_spdr.exists() or not raw2_spdr.exists():
+        return {"status": "skip", "reason": "missing files"}
+    
+    # Load raw1 (unshifted)
+    raw1 = pd.read_csv(raw1_spdr)
+    raw1["Date"] = pd.to_datetime(raw1["Date"]).dt.normalize()
+    raw1 = raw1.sort_values("Date").set_index("Date")
+    
+    # Load raw2
+    raw2 = pd.read_parquet(raw2_spdr)
+    raw2["Date"] = pd.to_datetime(raw2["Date"]).dt.normalize()
+    raw2 = raw2.sort_values("Date").set_index("Date")
+    
+    # Find common dates and first common sector
+    common = raw1.index.intersection(raw2.index)
+    if len(common) < 10:
+        return {"status": "insufficient_overlap", "n_common": len(common)}
+    
+    common_cols = [c for c in raw1.columns if c in raw2.columns]
+    if not common_cols:
+        return {"status": "no_common_columns"}
+    
+    test_col = common_cols[0]  # Test with first sector
+    
+    # Sample 20 dates
+    sample_idx = np.linspace(10, len(common) - 2, min(20, len(common) - 11)).astype(int)
+    sample_dates = common[sample_idx]
+    
+    shifted_matches = 0
+    unshifted_matches = 0
+    
+    for date in sample_dates:
+        raw2_val = raw2.loc[date, test_col]
+        raw1_val_same = raw1.loc[date, test_col]
+        
+        prev_idx = common.get_loc(date) - 1
+        if prev_idx >= 0:
+            prev_date = common[prev_idx]
+            raw1_val_prev = raw1.loc[prev_date, test_col]
+            
+            if abs(raw2_val - raw1_val_prev) < 1e-6:
+                shifted_matches += 1
+            if abs(raw2_val - raw1_val_same) < 1e-6:
+                unshifted_matches += 1
+    
+    n_sample = len(sample_dates)
+    result = {
+        "n_tested": n_sample,
+        "shifted_matches": shifted_matches,
+        "unshifted_matches": unshifted_matches,
+        "shifted_pct": shifted_matches / n_sample,
+        "unshifted_pct": unshifted_matches / n_sample,
+    }
+    
+    if result["shifted_pct"] > 0.9:
+        result["semantics"] = "SHIFTED"
+        result["interpretation"] = "raw2[t] = raw1[t-1] → correlations see PREVIOUS trading day"
+    elif result["unshifted_pct"] > 0.9:
+        result["semantics"] = "UNSHIFTED"
+        result["interpretation"] = "raw2[t] = raw1[t] → correlations see SAME day"
+    else:
+        result["semantics"] = "INCONSISTENT"
+        result["interpretation"] = "CRITICAL: inconsistent shift behavior"
+    
+    return result
+
+
+def _get_trading_calendar(sector_logrets: pd.DataFrame) -> pd.DatetimeIndex:
+    """Extract and validate trading calendar from sector data."""
+    dates = pd.to_datetime(sector_logrets["Date"], utc=False).sort_values()
+    calendar = pd.DatetimeIndex(dates.unique())
+    
+    if not calendar.is_monotonic_increasing:
+        raise AssertionError("Trading calendar is not monotonically increasing")
+    
+    if len(calendar) < len(dates):
+        n_dup = len(dates) - len(calendar)
+        raise AssertionError(f"Trading calendar has {n_dup} duplicate dates")
+    
+    return calendar
+
+
 def _load_spdr_prices(spdr_path: Path) -> pd.DataFrame:
     _require_file(spdr_path)
 
@@ -77,12 +164,12 @@ def _load_macro(raw_data_3_dir: Path, *, strict: bool = True) -> pd.DataFrame:
         _require_columns(
             futures,
             futures_path,
-            ["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"],
+            ["Date", "^TNX_diff", "CL=F_asinh_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"],
         )
-        futures = futures[["Date", "^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]].copy()
+        futures = futures[["Date", "^TNX_diff", "CL=F_asinh_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]].copy()
     else:
         _require_columns(futures, futures_path, ["Date"])
-        wanted = ["^TNX_diff", "CL=F_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]
+        wanted = ["^TNX_diff", "CL=F_asinh_diff", "DX-Y.NYB_logret", "GC=F_logret", "^VIX_dlog1p"]
         keep = [c for c in wanted if c in futures.columns]
         missing = [c for c in wanted if c not in futures.columns]
         if missing:
@@ -121,7 +208,7 @@ def _load_macro(raw_data_3_dir: Path, *, strict: bool = True) -> pd.DataFrame:
     return macro
 
 
-def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: str) -> pd.DataFrame:
+def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: str, trading_calendar: pd.DatetimeIndex | None = None) -> pd.DataFrame:
     s = pd.to_numeric(s, errors="coerce")
     tmp = s.rename("value").to_frame()
     tmp.index = pd.to_datetime(tmp.index, utc=False)
@@ -129,6 +216,12 @@ def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: s
     tmp = tmp.reset_index()
     if tmp.empty:
         return pd.DataFrame(columns=["Date", "Sector", "Feature", "value"])
+
+    # FIX: Filter to trading calendar to avoid broadcasting on non-trading days
+    if trading_calendar is not None:
+        tmp = tmp[tmp["Date"].isin(trading_calendar)]
+        if tmp.empty:
+            return pd.DataFrame(columns=["Date", "Sector", "Feature", "value"])
 
     dates = tmp["Date"].to_numpy()
     values = tmp["value"].to_numpy()
@@ -139,10 +232,10 @@ def _broadcast_series_to_sectors(s: pd.Series, *, sectors: list[str], feature: s
     out = pd.DataFrame({"Date": rep_dates, "Sector": rep_sectors, "Feature": feature, "value": rep_values})
     return out[["Date", "Sector", "Feature", "value"]]
 
-def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: list[str]) -> list[pd.DataFrame]:
+def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: list[str], trading_calendar: pd.DatetimeIndex) -> list[pd.DataFrame]:
     drivers: dict[str, str] = {
         "rates": "^TNX_diff",
-        "oil": "CL=F_diff",
+        "oil": "CL=F_asinh_diff",
         "usd": "DX-Y.NYB_logret",
         "bonds": "TLT_logret",
         "vix": "^VIX_dlog1p",
@@ -153,6 +246,14 @@ def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: 
     df = macro.copy()
     df = df.sort_values("Date")
     df = df.set_index("Date")
+    
+    # CRITICAL FIX: Reindex to trading calendar so rolling window = N trading days, not calendar days
+    df = df.reindex(trading_calendar)
+    
+    # Bounded ffill for macro-macro (prevent staleness)
+    for col in df.columns:
+        if df[col].isna().any():
+            df[col] = df[col].ffill(limit=5)  # Conservative for daily drivers
 
     names = sorted(drivers)
     out: list[pd.DataFrame] = []
@@ -161,11 +262,18 @@ def _macro_macro_corrs(macro: pd.DataFrame, *, windows: Iterable[int], sectors: 
         minp = int(MIN_PERIODS_BY_WINDOW.get(int(w), max(2, int(w) // 2)))
         for i, a in enumerate(names):
             for b in names[i + 1 :]:
+                if drivers[a] not in df.columns or drivers[b] not in df.columns:
+                    print(
+                        f"WARNING: Skipping macro-macro corr {a}_{b}: "
+                        f"missing {drivers[a]} or {drivers[b]}"
+                    )
+                    continue
+                
                 sa = pd.to_numeric(df[drivers[a]], errors="coerce")
                 sb = pd.to_numeric(df[drivers[b]], errors="coerce")
                 corr = sa.rolling(window=int(w), min_periods=minp).corr(sb)
                 feat = f"corr_macro_{a}_{b}_{int(w)}"
-                out.append(_broadcast_series_to_sectors(corr, sectors=sectors, feature=feat))
+                out.append(_broadcast_series_to_sectors(corr, sectors=sectors, feature=feat, trading_calendar=trading_calendar))
 
     return out
 
@@ -189,11 +297,45 @@ def _rolling_corr_against_drivers(
 
     df = sector_logrets.merge(macro, on="Date", how="left")
     df = df.sort_values("Date")
+    
+    # FIX: Bounded forward-fill macro (Last Known Value with staleness limit)
+    # Conservative limits to prevent train/live mismatch
+    macro_cols = [c for c in df.columns if c not in ["Date", *sector_cols]]
+    ffill_limits = {
+        "_logret": 5,      # Daily data
+        "_diff": 5,        # Daily data  
+        "_dlog1p": 5,      # Daily data
+        "_asinh_diff": 5,  # Daily data
+    }
+    
+    for col in macro_cols:
+        if df[col].isna().any():
+            # Determine limit based on column suffix
+            limit = 5  # Conservative default for daily
+            for suffix, lim in ffill_limits.items():
+                if col.endswith(suffix):
+                    limit = lim
+                    break
+            
+            n_nan_before = df[col].isna().sum()
+            df[col] = df[col].ffill(limit=limit)
+            n_nan_after = df[col].isna().sum()
+            
+            if n_nan_after > 0 and n_nan_before > n_nan_after:
+                first_valid = df[col].first_valid_index()
+                if first_valid is not None:
+                    interior_nans = df.loc[first_valid:, col].isna().sum()
+                    if interior_nans > 0:
+                        print(
+                            f"WARNING: {col} has {interior_nans} interior NaNs after bounded ffill "
+                            f"(limit={limit}). This will propagate to correlations."
+                        )
+    
     sector_ret = df.set_index("Date")[sector_cols]
 
     drivers: dict[str, str] = {
         "rates": "^TNX_diff",
-        "oil": "CL=F_diff",
+        "oil": "CL=F_asinh_diff",
         "usd": "DX-Y.NYB_logret",
         "bonds": "TLT_logret",
         "vix": "^VIX_dlog1p",
@@ -222,23 +364,14 @@ def _rolling_corr_against_drivers(
         feature = f"corr_{driver_name}_{window}"
         long_frames.append(_to_long_feature(corr_df, feature))
 
-    roll_corr = sector_ret.rolling(window=window, min_periods=min_periods).corr()
-    roll_corr = roll_corr.rename(columns={c: c.removesuffix("_logret") for c in roll_corr.columns})
-
-    idx = pd.IndexSlice
-    for s in sectors:
-        if s in roll_corr.columns:
-            roll_corr.loc[idx[:, f"{s}_logret"], s] = np.nan
-
-    mean_corr_others = roll_corr.mean(axis=1, skipna=True)
-    mean_corr_others.index.names = ["Date", "Sector_logret"]
-    mean_corr_others = mean_corr_others.rename("value").reset_index()
-    mean_corr_others["Sector"] = mean_corr_others["Sector_logret"].str.replace("_logret", "", regex=False)
-    mean_corr_others = mean_corr_others.drop(columns=["Sector_logret"])
-    mean_corr_others["Feature"] = f"mean_corr_others_{window}"
-    mean_corr_others = mean_corr_others[["Date", "Sector", "Feature", "value"]]
-
-    long_frames.append(mean_corr_others)
+    # IMPORTANT: This is correlation with equal-weighted market average, NOT mean pairwise correlation
+    # Renamed to reflect actual computation (was misleadingly named mean_corr_others)
+    market_avg = sector_ret.mean(axis=1)
+    corr_vs_market = sector_ret.rolling(window=window, min_periods=min_periods).corr(market_avg)
+    corr_vs_market = corr_vs_market.rename(columns={c: c.removesuffix("_logret") for c in corr_vs_market.columns})
+    
+    feature = f"corr_with_sector_mean_{window}"  # FIX: Accurate name
+    long_frames.append(_to_long_feature(corr_vs_market, feature))
 
     return long_frames
 
@@ -268,6 +401,24 @@ def main() -> None:
     if not raw_data_3_dir.exists():
         raise FileNotFoundError(f"Required input directory not found: {raw_data_3_dir}")
 
+    # CRITICAL: Verify shift semantics BEFORE processing correlations
+    print("\n[CRITICAL] Verifying raw2 shift semantics...")
+    shift_check = _verify_raw2_shift_semantics(mm_root)
+    print(f"Shift verification: {shift_check}")
+    
+    if shift_check.get("semantics") == "SHIFTED":
+        print(
+            "\n⚠️  WARNING: raw2 uses SHIFTED semantics (raw2[t] = raw1[t-1])\n"
+            "    → Correlations at date t use PREVIOUS trading day returns\n"
+            "    → Ensure this aligns with feature timing from data_engineering_1\n"
+            "    → If labels use unshifted prices, you have OFF-BY-ONE mismatch!\n"
+        )
+    elif shift_check.get("semantics") == "INCONSISTENT":
+        raise AssertionError(
+            f"CRITICAL: Inconsistent shift behavior!\n{shift_check}\n"
+            "Check data_optimization_1.py output."
+        )
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sector_logrets = _load_spdr_prices(spdr_path)
@@ -276,9 +427,14 @@ def main() -> None:
     sector_cols = [c for c in sector_logrets.columns if c != "Date"]
     sectors = [c.removesuffix("_logret") for c in sector_cols]
 
+    # Extract and validate trading calendar
+    trading_calendar = _get_trading_calendar(sector_logrets)
+    print(f"Trading calendar: {len(trading_calendar)} days from {trading_calendar.min().date()} to {trading_calendar.max().date()}")
+
     long_frames: list[pd.DataFrame] = []
     for w in SECTOR_MACRO_WINDOWS:
         minp = int(MIN_PERIODS_BY_WINDOW.get(int(w), max(2, int(w) // 2)))
+        print(f"Computing sector-macro correlations for window={w}, min_periods={minp}...")
         long_frames.extend(
             _rolling_corr_against_drivers(
                 sector_logrets,
@@ -289,7 +445,9 @@ def main() -> None:
             )
         )
 
-    long_frames.extend(_macro_macro_corrs(macro, windows=MACRO_MACRO_WINDOWS, sectors=sectors))
+    print(f"Computing macro-macro correlations for windows={MACRO_MACRO_WINDOWS}...")
+    long_frames.extend(_macro_macro_corrs(macro, windows=MACRO_MACRO_WINDOWS, sectors=sectors, trading_calendar=trading_calendar))
+    
     features_long = pd.concat(long_frames, ignore_index=True)
 
     features_long = features_long.sort_values(["Date", "Sector", "Feature"], kind="mergesort")
@@ -301,7 +459,13 @@ def main() -> None:
     ].copy()
     features_long.to_parquet(out_path, index=False)
 
-    print(f"Wrote {len(features_long):,} rows to: {out_path}")
+    print(f"\nWrote {len(features_long):,} rows to: {out_path}")
+    
+    # Summary statistics
+    n_features = features_long["Feature"].nunique()
+    n_dates = features_long["Date"].nunique()
+    n_sectors = features_long["Sector"].nunique()
+    print(f"Summary: {n_features} features × {n_sectors} sectors × {n_dates} dates")
 
 if __name__ == "__main__":
     main()
