@@ -9,8 +9,9 @@ Training script for Dual-Stage Model (Gate Classifier + Ranker)
 import sys
 from pathlib import Path
 
-# Add ModularMonolith to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add repo root to path so `import ModularMonolith...` works when executing
+# this file directly (e.g., `python ModularMonolith/run_training_h21.py`).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ModularMonolith.src.models.train_dual_system import train_dual_model
 
@@ -24,7 +25,7 @@ if __name__ == "__main__":
     print("  Seeds: [42, 43, 44]")
     print("  Run allocation: Auto-continue from last Run #")
     print("  Time-decay: λ=1260 days (5 years half-life)")
-    print("  CV: Expanding window, annual training periods")
+    print("  CV: Rolling window (train=5y, test=1y, step=1y) with purge_gap=h")
     print("=" * 80)
     print()
     
@@ -33,6 +34,7 @@ if __name__ == "__main__":
         seeds=[42, 43, 44],
         optuna_n_trials=25,
         use_gpu=True,
+        outer_cv_mode="rolling_5y1y",
     )
     
     print()

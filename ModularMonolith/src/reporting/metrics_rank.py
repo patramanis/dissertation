@@ -19,6 +19,39 @@ import pandas as pd
 from scipy import stats
 
 
+# =============================================================================
+# Ranking convention (CRITICAL)
+# =============================================================================
+# End-to-end convention for any "pick top-k" by predicted score:
+#   - LOWER score = better (use nsmallest)
+# This must match diagnostics and portfolio selection logic.
+RANK_SCORE_LOWER_IS_BETTER: bool = True
+
+
+def _k_eff(k: int, group_size: int) -> int:
+    """Effective k for a group.
+
+    Contract: k_eff = min(k, group_size) and we do NOT skip groups
+    just because group_size < k (unless group_size == 0).
+    """
+    if group_size <= 0:
+        return 0
+    kk = int(k)
+    if kk <= 0:
+        raise ValueError("k must be positive")
+    return min(kk, int(group_size))
+
+
+def _pred_top_k_idx(sub: pd.DataFrame, *, pred_col: str, k: int) -> pd.Index:
+    """Return indices of the predicted top-k within a group under the global convention."""
+    k_eff = _k_eff(k, len(sub))
+    if k_eff <= 0:
+        return sub.index[:0]
+    if RANK_SCORE_LOWER_IS_BETTER:
+        return sub[pred_col].nsmallest(k_eff).index
+    return sub[pred_col].nlargest(k_eff).index
+
+
 @dataclass(frozen=True)
 class RankMetrics:
     """Container for ranking metrics."""
@@ -125,24 +158,22 @@ def precision_at_k(
     
     precisions: list[float] = []
     for _, sub in df.groupby("g", sort=False):
-        if len(sub) < k:
+        k_eff = _k_eff(k, len(sub))
+        if k_eff <= 0:
             continue
         
-        # ✅ RANKER POLARITY FIX: Lower score = better (anti-signal detected)
-        # Diagnostic showed IC = -0.0259 → model learns opposite direction
-        # Use nsmallest (bottom-K) instead of nlargest (top-K)
-        top_k_idx = sub["pred"].nsmallest(k).index
+        top_k_idx = _pred_top_k_idx(sub, pred_col="pred", k=k_eff)
         top_k_actual = sub.loc[top_k_idx, "y"]
         
         if threshold is None:
             # Top-K by actual (baseline)
-            actual_top_k = set(sub["y"].nlargest(k).index)
+            actual_top_k = set(sub["y"].nlargest(k_eff).index)
             hits = sum(1 for idx in top_k_idx if idx in actual_top_k)
         else:
             # Winners by threshold
             hits = sum(1 for v in top_k_actual if v > threshold)
         
-        precisions.append(float(hits) / float(k))
+        precisions.append(float(hits) / float(k_eff))
     
     if not precisions:
         return 0.0
@@ -174,14 +205,12 @@ def hit_rate_at_k(
     total = 0
     
     for _, sub in df.groupby("g", sort=False):
-        if len(sub) < k:
+        k_eff = _k_eff(k, len(sub))
+        if k_eff <= 0:
             continue
-        
-        # Guard nlargest with min(k, len) to handle edge cases
-        k_safe = min(k, len(sub))
-        # ✅ RANKER POLARITY FIX: Lower score = better
-        pred_top_k = set(sub["pred"].nsmallest(k_safe).index)
-        actual_top_k = set(sub["y"].nlargest(k_safe).index)
+
+        pred_top_k = set(_pred_top_k_idx(sub, pred_col="pred", k=k_eff))
+        actual_top_k = set(sub["y"].nlargest(k_eff).index)
         
         if pred_top_k & actual_top_k:  # Any overlap
             hits += 1
@@ -224,15 +253,15 @@ def lift_at_k(
     
     lifts: list[float] = []
     for _, sub in df.groupby("g", sort=False):
-        if len(sub) < k:
+        k_eff = _k_eff(k, len(sub))
+        if k_eff <= 0:
             continue
         
         base_rate = sub["y_bin"].mean()
         if base_rate == 0:  # No winners in this date
             continue
         
-        # ✅ RANKER POLARITY FIX: Lower score = better
-        top_k_idx = sub["pred"].nsmallest(k).index
+        top_k_idx = _pred_top_k_idx(sub, pred_col="pred", k=k_eff)
         precision_k = sub.loc[top_k_idx, "y_bin"].mean()
         
         lift = (precision_k / base_rate) - 1.0
@@ -278,12 +307,12 @@ def uplift_at_k(
     
     uplifts: list[float] = []
     for _, sub in df.groupby("g", sort=False):
-        if len(sub) < k:
+        k_eff = _k_eff(k, len(sub))
+        if k_eff <= 0:
             continue
         
         mean_all = sub["y"].mean()
-        # ✅ RANKER POLARITY FIX: Lower score = better
-        top_k_idx = sub["pred"].nsmallest(k).index
+        top_k_idx = _pred_top_k_idx(sub, pred_col="pred", k=k_eff)
         mean_selected = sub.loc[top_k_idx, "y"].mean()
         
         # Difference, not ratio
@@ -445,12 +474,13 @@ def compute_precision_over_time(
     
     precs = []
     for dt, sub in df.groupby(date_col, sort=True):
-        if len(sub) < k:
+        k_eff = _k_eff(k, len(sub))
+        if k_eff <= 0:
             continue
-        
-        top_k_idx = sub[pred_col].nlargest(k).index
+
+        top_k_idx = _pred_top_k_idx(sub, pred_col=pred_col, k=k_eff)
         hits = sum(1 for idx in top_k_idx if sub.loc[idx, target_col] > cost_threshold)
-        precs.append({"Date": dt, "precision": float(hits) / float(k)})
+        precs.append({"Date": dt, "precision": float(hits) / float(k_eff)})
     
     if not precs:
         return pd.DataFrame(columns=["Date", "precision", "precision_rolling"])

@@ -41,13 +41,11 @@ from ModularMonolith.data.dataset_shaping import (
 )
 from ModularMonolith.src.config.cv_config import get_cv_config
 from ModularMonolith.src.cv.purged_walk_forward_cv import PurgedWalkForwardCV
-from ModularMonolith.src.cv.rolling_window_cv import RollingWindowCV
 from ModularMonolith.src.cv.run_nested_cv import (
     FoldResult,
     NestedCVConfig,
     run_outer_folds,
 )
-from ModularMonolith.src.cv.warmup import WarmupReport, compute_warmup_start_date
 from ModularMonolith.src.reporting.drift import (
     DriftDetector,
     compute_drift_over_time,
@@ -491,7 +489,6 @@ class DualModelTrainer:
         enable_rolling_zscore: bool = True,  # FIX: Enabled by default to prevent drift
         rolling_zscore_window: int = 252,
         rolling_zscore_min_periods: int = 60,
-        rolling_zscore_all_numeric: bool = False,
         gate_label_mode: Literal["excess_gt_cost", "topk", "top_pct"] = "excess_gt_cost",
         gate_topk: int = 3,
         gate_top_pct: float = 0.30,
@@ -500,15 +497,6 @@ class DualModelTrainer:
         ranker_drop_date_constant_features: bool = True,
         ranker_constant_std_eps: float = 1e-12,
         ranker_constant_frac_threshold: float = 0.99,
-        outer_cv_mode: Literal["expanding", "rolling_5y1y"] = "expanding",
-        rolling_train_years: int = 5,
-        rolling_test_years: int = 1,
-        rolling_step_years: int = 1,
-        rolling_nan_ratio_threshold: float = 0.01,
-        rolling_stability_days: int = 60,
-        rolling_max_lookback_days: int | None = None,
-        rolling_warmup_start_date: str | None = None,
-        rolling_min_train_years: int = 3,
         deterministic_mode: bool = False,
     ) -> None:
         """
@@ -570,8 +558,6 @@ class DualModelTrainer:
         self.enable_rolling_zscore = bool(enable_rolling_zscore)
         self.rolling_zscore_window = int(rolling_zscore_window)
         self.rolling_zscore_min_periods = int(rolling_zscore_min_periods)
-        # Diagnostic/advanced: normalize all numeric (except rank_*) to mitigate drift.
-        self.rolling_zscore_all_numeric = bool(rolling_zscore_all_numeric)
 
         # Gate target definition
         self.gate_label_mode = gate_label_mode
@@ -590,24 +576,10 @@ class DualModelTrainer:
         self.ranker_drop_date_constant_features = bool(ranker_drop_date_constant_features)
         self.ranker_constant_std_eps = float(ranker_constant_std_eps)
         self.ranker_constant_frac_threshold = float(ranker_constant_frac_threshold)
-
-        # Outer CV mode
-        self.outer_cv_mode = outer_cv_mode
-        self.rolling_train_years = int(rolling_train_years)
-        self.rolling_test_years = int(rolling_test_years)
-        self.rolling_step_years = int(rolling_step_years)
-        self.rolling_nan_ratio_threshold = float(rolling_nan_ratio_threshold)
-        self.rolling_stability_days = int(rolling_stability_days)
-        self.rolling_max_lookback_days = (None if rolling_max_lookback_days is None else int(rolling_max_lookback_days))
-        self.rolling_warmup_start_date = rolling_warmup_start_date
-        self.rolling_min_train_years = int(rolling_min_train_years)
         
         # Will be set during run
         self.data: ShapingResult | None = None
         self.run_manager: RunManager | None = None
-        self._cv_params: dict[str, Any] | None = None
-        self._outer_cv: Any | None = None
-        self._warmup_report: WarmupReport | None = None
         
         # Fold result collectors
         self._gate_fold_results: list[FoldResult] = []
@@ -702,24 +674,15 @@ class DualModelTrainer:
             return X
 
         # Heuristic: normalize only scale-like columns; avoid cross-sectional ranks.
-        # Optional drift kill-switch: normalize all numeric columns except rank_*.
         def should_norm(col: str) -> bool:
             c = str(col).lower()
             if c.startswith("rank_"):
                 return False
-            if self.rolling_zscore_all_numeric:
-                return True
             return ("idio_vol" in c) or c.startswith("vol") or ("vix" in c)
 
         cols = [c for c in X.columns if should_norm(str(c))]
         if not cols:
             return X
-
-        # In all-numeric mode, restrict to numeric dtypes (defensive).
-        if self.rolling_zscore_all_numeric:
-            cols = [c for c in cols if pd.api.types.is_numeric_dtype(X[c])]
-            if not cols:
-                return X
 
         tmp = pd.concat([keys.reset_index(drop=True), X[cols].reset_index(drop=True)], axis=1)
         tmp["Date"] = pd.to_datetime(tmp["Date"], errors="raise")
@@ -1070,31 +1033,21 @@ class DualModelTrainer:
             self._log(f"Error saving final models: {e}")
             self.run_manager.save_artifact({"error": str(e)}, "model_save_error.json", "models")
     
-    def _get_outer_cv(self) -> Any:
-        """Get outer CV splitter (built once per run)."""
-        if self._outer_cv is not None:
-            return self._outer_cv
-        cv_params = self._cv_params or get_cv_config(self.horizon)
-
-        if self.outer_cv_mode == "expanding":
-            self._outer_cv = PurgedWalkForwardCV(
-                n_splits=cv_params.get("n_splits"),
-                test_size=cv_params["test_size"],
-                purge_gap=cv_params["purge_gap"],
-                embargo=cv_params["embargo"],
-                min_train_size=cv_params["min_train_size"],
-                test_start=cv_params.get("test_start"),
-            )
-            return self._outer_cv
-
-        raise RuntimeError(
-            "outer_cv_mode requires run() to build the outer CV after warmup detection. "
-            f"Got outer_cv_mode={self.outer_cv_mode!r} but _outer_cv is None."
+    def _get_outer_cv(self) -> PurgedWalkForwardCV:
+        """Get outer CV splitter."""
+        cv_params = get_cv_config(self.horizon)
+        return PurgedWalkForwardCV(
+            n_splits=cv_params.get("n_splits"),
+            test_size=cv_params["test_size"],
+            purge_gap=cv_params["purge_gap"],
+            embargo=cv_params["embargo"],
+            min_train_size=cv_params["min_train_size"],
+            test_start=cv_params.get("test_start"),
         )
     
     def _build_gate_config(self) -> NestedCVConfig:
         """Build config for gate classifier."""
-        cv_params = self._cv_params or get_cv_config(self.horizon)
+        cv_params = get_cv_config(self.horizon)
         
         inner_params = dict(self.gate_params)
         if self.optuna_n_trials > 0:
@@ -1115,16 +1068,7 @@ class DualModelTrainer:
     
     def _build_ranker_config(self) -> NestedCVConfig:
         """Build config for ranker."""
-        cv_params = dict(self._cv_params or get_cv_config(self.horizon))
-
-        # If using rolling outer CV, make the ranker constant-feature filter fold-safe
-        # by applying it inside run_outer_folds using TRAIN ONLY.
-        if self.outer_cv_mode.startswith("rolling"):
-            cv_params["ranker_date_constant_filter"] = {
-                "enabled": True,
-                "std_eps": float(self.ranker_constant_std_eps),
-                "frac_threshold": float(self.ranker_constant_frac_threshold),
-            }
+        cv_params = get_cv_config(self.horizon)
         
         inner_params = dict(self.ranker_params)
         if self.optuna_n_trials > 0:
@@ -1177,12 +1121,7 @@ class DualModelTrainer:
         """
         self._log("Training Ranker...")
 
-        # IMPORTANT: For rolling outer CV, avoid global (all-data) feature filtering.
-        # A fold-safe version is applied inside run_outer_folds via config.outer_params.
-        if self.outer_cv_mode.startswith("rolling"):
-            X_rank = X
-        else:
-            X_rank = self._select_ranker_feature_subset(X, y)
+        X_rank = self._select_ranker_feature_subset(X, y)
         
         # FIX #8: Ranker group validation (each group = single Date with len(EXPECTED_SECTORS) rows)
         if "Date" in y.columns:
@@ -1867,8 +1806,23 @@ class DualModelTrainer:
         
         # 2. Initialize RunManager
         self.run_manager = RunManager(base_dir=self.base_results_dir)
-        cv_config = dict(get_cv_config(self.horizon))
-        cv_config["outer_cv_mode"] = self.outer_cv_mode
+        cv_config = get_cv_config(self.horizon)
+        
+        run_dir = self.run_manager.create_run(
+            horizon=self.horizon,
+            seeds=self.seeds,
+            cost_bps=float(self.data.cost_threshold) * 10_000.0,
+            cv_config=cv_config,
+            gate_params=self.gate_params,
+            ranker_params=self.ranker_params,
+            X=self.data.X,
+            y_gate=self.data.y_gate,
+            y_rank=self.data.y_rank,
+            group_sizes=self.data.group_sizes,
+            feature_selection_method=self.feature_selection,
+            top_n_features=self.top_n_features,
+            optuna_n_trials=self.optuna_n_trials,
+        )
         
         # 3. Prepare data
         X = self.data.X.copy()
@@ -1886,87 +1840,6 @@ class DualModelTrainer:
         else:
             # Fallback: all columns are already numeric (standard case from dataset_shaping)
             X = X.astype(np.float32)
-
-        # 3b. Build outer CV (rolling requires warmup detection)
-        self._cv_params = cv_config
-        self._outer_cv = None
-        self._warmup_report = None
-        if self.outer_cv_mode == "expanding":
-            self._outer_cv = self._get_outer_cv()
-        elif self.outer_cv_mode == "rolling_5y1y":
-            if self.rolling_warmup_start_date is not None:
-                warmup_start = pd.Timestamp(self.rolling_warmup_start_date).normalize()
-                self._warmup_report = WarmupReport(
-                    warmup_start_date=warmup_start,
-                    nan_ratio_at_start=float("nan"),
-                    max_lookback_days_used=int(self.rolling_max_lookback_days or 252),
-                    max_lookback_days_inferred=int(self.rolling_max_lookback_days or 252),
-                    dates_cut_before_warmup=-1,
-                )
-            else:
-                self._warmup_report = compute_warmup_start_date(
-                    X=X,
-                    keys=y[["Date", "Sector"]],
-                    feature_cols=list(X.columns),
-                    nan_ratio_threshold=float(self.rolling_nan_ratio_threshold),
-                    stability_days=int(self.rolling_stability_days),
-                    purge_gap=int(self.horizon),
-                    max_lookback_days=self.rolling_max_lookback_days,
-                )
-
-            cv_config.update(
-                {
-                    "rolling": {
-                        "train_years": int(self.rolling_train_years),
-                        "test_years": int(self.rolling_test_years),
-                        "step_years": int(self.rolling_step_years),
-                        "purge_gap": int(self.horizon),
-                        "nan_ratio_threshold": float(self.rolling_nan_ratio_threshold),
-                        "stability_days": int(self.rolling_stability_days),
-                        "max_lookback_days": None if self.rolling_max_lookback_days is None else int(self.rolling_max_lookback_days),
-                        "min_train_years": int(self.rolling_min_train_years),
-                        "warmup_start_date": str(self._warmup_report.warmup_start_date.date()),
-                        "warmup_report": {
-                            "nan_ratio_at_start": float(self._warmup_report.nan_ratio_at_start),
-                            "max_lookback_days_used": int(self._warmup_report.max_lookback_days_used),
-                            "max_lookback_days_inferred": int(self._warmup_report.max_lookback_days_inferred),
-                            "dates_cut_before_warmup": int(self._warmup_report.dates_cut_before_warmup),
-                        },
-                    }
-                }
-            )
-
-            self._outer_cv = RollingWindowCV(
-                train_years=int(self.rolling_train_years),
-                test_years=int(self.rolling_test_years),
-                step_years=int(self.rolling_step_years),
-                purge_gap=int(self.horizon),
-                warmup_start_date=self._warmup_report.warmup_start_date,
-                min_train_years=int(self.rolling_min_train_years),
-            )
-            self._log(
-                f"Rolling outer CV: warmup_start={self._warmup_report.warmup_start_date.date()} "
-                f"train={self.rolling_train_years}y test={self.rolling_test_years}y step={self.rolling_step_years}y purge_gap={self.horizon}"
-            )
-        else:
-            raise ValueError(f"Unknown outer_cv_mode: {self.outer_cv_mode}")
-
-        # 3c. Create run folder AFTER CV config finalized
-        run_dir = self.run_manager.create_run(
-            horizon=self.horizon,
-            seeds=self.seeds,
-            cost_bps=float(self.data.cost_threshold) * 10_000.0,
-            cv_config=cv_config,
-            gate_params=self.gate_params,
-            ranker_params=self.ranker_params,
-            X=X,
-            y_gate=self.data.y_gate,
-            y_rank=self.data.y_rank,
-            group_sizes=self.data.group_sizes,
-            feature_selection_method=self.feature_selection,
-            top_n_features=self.top_n_features,
-            optuna_n_trials=self.optuna_n_trials,
-        )
         
         # 4. Train Gate Classifier
         gate_oof = self._train_gate(X, y, groups)
@@ -2123,8 +1996,6 @@ def train_dual_model(
     optuna_n_trials: int = 25,
     use_gpu: bool = True,
     verbose: bool = True,
-    outer_cv_mode: Literal["expanding", "rolling_5y1y"] = "expanding",
-    rolling_warmup_start_date: str | None = None,
 ) -> DualModelResult:
     """
     Convenience function to train dual model.
@@ -2139,8 +2010,6 @@ def train_dual_model(
         optuna_n_trials=optuna_n_trials,
         use_gpu=use_gpu,
         verbose=verbose,
-        outer_cv_mode=outer_cv_mode,
-        rolling_warmup_start_date=rolling_warmup_start_date,
     )
     
     result = trainer.run()
@@ -2161,13 +2030,6 @@ if __name__ == "__main__":
     parser.add_argument("--optuna-trials", type=int, default=0)
     parser.add_argument("--no-gpu", action="store_true")
     parser.add_argument("--seeds", type=int, default=10, help="Number of seeds for ensemble")
-    parser.add_argument("--outer-mode", type=str, default="expanding", choices=["expanding", "rolling_5y1y"])
-    parser.add_argument(
-        "--rolling-warmup-start-date",
-        type=str,
-        default=None,
-        help="Optional override, e.g. 2001-10-08 (skips data-driven warmup detection)",
-    )
     
     args = parser.parse_args()
     
@@ -2176,8 +2038,6 @@ if __name__ == "__main__":
         seeds=list(range(args.seeds)),
         optuna_n_trials=args.optuna_trials,
         use_gpu=not args.no_gpu,
-        outer_cv_mode=args.outer_mode,
-        rolling_warmup_start_date=args.rolling_warmup_start_date,
     )
     
     print(f"\nResults saved to: {result.run_dir}")

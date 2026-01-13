@@ -1268,7 +1268,12 @@ def run_inner_search(
                         pass
 
                 std_vals = inner_oof["pred_std"].to_numpy()
-                u_grid = [float(np.quantile(std_vals, q)) for q in u_q]
+                # Uncertainty gating requires >1 seed; with a single seed pred_std is identically 0
+                # and any tuning of u_star becomes meaningless.
+                if len(getattr(config, "seeds", []) or []) < 2:
+                    u_grid = [float("inf")]
+                else:
+                    u_grid = [float(np.quantile(std_vals, q)) for q in u_q]
 
                 best = (-np.inf, None, None)
                 y_true = inner_oof["y_true"].to_numpy()
@@ -1287,7 +1292,8 @@ def run_inner_search(
                             best = cand
 
                 if best[1] is not None and best[2] is not None:
-                    thresholds = {"p_star": float(best[1]), "u_star": float(best[2])}
+                    # Do not overwrite: preserve flags like polarity_flipped.
+                    thresholds = {**dict(thresholds), "p_star": float(best[1]), "u_star": float(best[2])}
 
     return SelectionResult(
         chosen_features=chosen_features,
@@ -1334,6 +1340,45 @@ def run_outer_folds(
             raise ValueError(f"y contains multiple cost_bps values: {cb.tolist()}")
 
     oof_rows: list[pd.DataFrame] = []
+
+    def _maybe_apply_ranker_date_constant_filter(
+        *,
+        X_tr: pd.DataFrame,
+        y_tr: pd.DataFrame,
+        X_te: pd.DataFrame,
+        fold_id: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        cfg = dict(getattr(config, "outer_params", {}) or {})
+        filt = cfg.get("ranker_date_constant_filter")
+        if not isinstance(filt, dict):
+            return X_tr, X_te
+        if not bool(filt.get("enabled", False)):
+            return X_tr, X_te
+
+        if "Date" not in y_tr.columns:
+            raise ValueError("ranker_date_constant_filter requires y_tr['Date']")
+
+        std_eps = float(filt.get("std_eps", 1e-12))
+        frac_threshold = float(filt.get("frac_threshold", 0.99))
+
+        # Compute cross-sectional std per Date (training only).
+        # Features are considered "constant" on a Date if std <= std_eps.
+        # Drop features that are constant on >= frac_threshold of dates.
+        Xn = X_tr.apply(pd.to_numeric, errors="coerce")
+        cs_std = Xn.groupby(y_tr["Date"], sort=False).std(ddof=0)
+        if cs_std.empty:
+            return X_tr, X_te
+
+        frac_constant = (cs_std <= std_eps).mean(axis=0)
+        keep_cols = frac_constant[frac_constant < frac_threshold].index.tolist()
+
+        if len(keep_cols) == 0:
+            raise ValueError(
+                f"[ranker_date_constant_filter fold={fold_id}] All features would be dropped; "
+                f"std_eps={std_eps} frac_threshold={frac_threshold}."
+            )
+
+        return X_tr[keep_cols], X_te[keep_cols]
 
     for fold_id, (outer_train_idx, outer_test_idx) in enumerate(outer_cv.split(X, y, groups=groups)):
         outer_train_idx = _as_numpy_index(outer_train_idx)
@@ -1426,6 +1471,9 @@ def run_outer_folds(
                     win_dates = int(y_tr.loc[winners, "Date"].nunique())
                     if win_dates < int(config.min_rank_train_winner_dates):
                         continue
+
+            # Fold-safe ranker hygiene: drop date-constant features using TRAIN ONLY.
+            X_tr, X_te = _maybe_apply_ranker_date_constant_filter(X_tr=X_tr, y_tr=y_tr, X_te=X_te, fold_id=fold_id)
 
         if X_te.empty:
             continue

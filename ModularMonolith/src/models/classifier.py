@@ -34,7 +34,6 @@ import pandas as pd
 # Local imports
 from ModularMonolith.data.dataset_shaping import (
     HORIZONS,
-    COST_THRESHOLD,
     ShapingResult,
     load_dual_model_dataset,
 )
@@ -666,11 +665,10 @@ class SectorRotationTrainer:
         backtest_top_k: int = 3,
         backtest_holding_period: int = 1,
         backtest_cost_bps: float = 0.0,
-        enable_rolling_zscore: bool = True,  # FIX: Enabled by default to prevent drift
+        enable_rolling_zscore: bool = False,
         rolling_zscore_window: int = 252,
         rolling_zscore_min_periods: int = 60,
         cost_threshold: float | None = None,
-        require_label_contract: bool = True,
         drop_cs_constant_features: bool = True,
         cs_constant_eps: float = 1e-6,
         ts_constant_eps: float = 1e-8,
@@ -693,7 +691,7 @@ class SectorRotationTrainer:
             use_gpu: Whether to use GPU acceleration
             verbose: Print progress
             base_results_dir: Base directory for results
-            cost_threshold: Cost threshold for binary labels (default: dataset_shaping.COST_THRESHOLD[horizon])
+            cost_threshold: Cost threshold for binary labels (default: 0.001 = 10bps)
             deterministic_mode: Force CPU, n_jobs=1 for bitwise reproducibility
         """
         if horizon not in HORIZONS:
@@ -741,14 +739,8 @@ class SectorRotationTrainer:
         self.rolling_zscore_window = int(rolling_zscore_window)
         self.rolling_zscore_min_periods = int(rolling_zscore_min_periods)
 
-        # Cost threshold must be a SINGLE source-of-truth for y_gate definition.
-        # Default to dataset_shaping's per-horizon calibrated threshold.
-        if cost_threshold is None:
-            self.cost_threshold = float(COST_THRESHOLD[int(horizon)])
-        else:
-            self.cost_threshold = float(cost_threshold)
-
-        self.require_label_contract = bool(require_label_contract)
+        # Cost threshold (default 10bps)
+        self.cost_threshold = float(cost_threshold) if cost_threshold is not None else 0.001
 
         # Cross-sectional hygiene: drop features with ~0 within-date variance.
         self.drop_cs_constant_features = bool(drop_cs_constant_features)
@@ -799,7 +791,6 @@ class SectorRotationTrainer:
             self.data = load_dual_model_dataset(
                 self.horizon,
                 cost_threshold=float(self.cost_threshold),
-                require_label_contract=bool(self.require_label_contract),
                 verbose=self.verbose,
             )
             if self.data is None:
@@ -867,8 +858,6 @@ class SectorRotationTrainer:
                 mean_cs_std = cs_std.mean(axis=0, skipna=True)
 
                 # Time variation proxy: per-date mean (panel collapse) std over time.
-                # This allows keeping global-by-date features (macro/regime) that are
-                # cross-sectionally constant but not constant over time.
                 ts_mean = X_cs.groupby(d_cs, sort=False).mean(numeric_only=True)
                 ts_mean = ts_mean.replace([np.inf, -np.inf], np.nan)
                 ts_std = ts_mean.std(axis=0, ddof=0, skipna=True)

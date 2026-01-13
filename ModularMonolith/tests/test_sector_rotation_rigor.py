@@ -110,6 +110,7 @@ def test_determinism_deterministic_mode(monkeypatch: pytest.MonkeyPatch, tmp_pat
     def run_once() -> pd.DataFrame:
         trainer = SectorRotationTrainer(
             horizon=21,
+            cost_threshold=float(data.cost_threshold),
             seeds=[42],
             optuna_n_trials=0,
             verbose=False,
@@ -141,6 +142,7 @@ def test_no_lookahead_negative_control(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     trainer1 = SectorRotationTrainer(
         horizon=21,
+        cost_threshold=float(base.cost_threshold),
         seeds=[42],
         optuna_n_trials=0,
         verbose=False,
@@ -166,6 +168,7 @@ def test_no_lookahead_negative_control(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     trainer2 = SectorRotationTrainer(
         horizon=21,
+        cost_threshold=float(pert.cost_threshold),
         seeds=[42],
         optuna_n_trials=0,
         verbose=False,
@@ -235,6 +238,7 @@ def test_date_purity_across_folds(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     trainer = SectorRotationTrainer(
         horizon=21,
+        cost_threshold=float(data.cost_threshold),
         seeds=[42],
         optuna_n_trials=0,
         verbose=False,
@@ -260,6 +264,7 @@ def test_multi_seed_ensemble_produces_nonzero_pred_std(monkeypatch: pytest.Monke
 
     trainer = SectorRotationTrainer(
         horizon=21,
+        cost_threshold=float(data.cost_threshold),
         seeds=[1, 2, 3],
         optuna_n_trials=0,
         verbose=False,

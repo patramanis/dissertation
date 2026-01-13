@@ -153,7 +153,16 @@ def compute_lift_with_diagnostics(
             continue
         
         # Get top-K by prediction
-        top_k_idx = sub["pred"].nlargest(k).index
+        # IMPORTANT: align Lift@K direction with the global ranking convention.
+        # The project-wide convention is "LOWER score = better".
+        # If diagnostics use the wrong tail (nlargest), Lift/Precision will look inverted
+        # even when RankIC and other metrics are correct.
+        from ModularMonolith.src.reporting.metrics_rank import RANK_SCORE_LOWER_IS_BETTER
+
+        if RANK_SCORE_LOWER_IS_BETTER:
+            top_k_idx = sub["pred"].nsmallest(k).index
+        else:
+            top_k_idx = sub["pred"].nlargest(k).index
         precision_k = sub.loc[top_k_idx, "y_bin"].mean()
         
         # Classification Lift formula: (Precision / BaseRate) - 1
@@ -253,7 +262,7 @@ def random_ranker_control(
     seed: int = 42,
 ) -> dict[str, float]:
     """
-    Negative control: Random ranker (permuted predictions within each date).
+    Negative control: Random ranker (random scores within each date).
     
     Expected: IC ≈ 0, Precision ≈ base_rate, Lift ≈ 0
     
@@ -270,11 +279,17 @@ def random_ranker_control(
     
     np.random.seed(seed)
     
-    # Permute predictions within each group
-    random_pred = np.zeros(len(df))
-    for g_val, sub_df in df.groupby("g", sort=False):
+    # IMPORTANT:
+    # The ranking metric implementation treats LOWER scores as better.
+    # If we used a permutation of y as the score, the top-k selection would be
+    # biased towards low y (because it picks nsmallest), producing an
+    # artificially bad (non-zero) control.
+    #
+    # Instead generate random scores independent of y to simulate chance.
+    random_pred = np.zeros(len(df), dtype=float)
+    for _g_val, sub_df in df.groupby("g", sort=False):
         idx = sub_df.index.to_numpy()
-        random_pred[idx] = np.random.permutation(sub_df["y"].to_numpy())
+        random_pred[idx] = np.random.standard_normal(size=len(idx))
     
     metrics = compute_rank_metrics(df["y"].to_numpy(), random_pred, df["g"].to_numpy())
     
@@ -290,20 +305,28 @@ def oracle_ranker_control(
     groups: np.ndarray | pd.Series,
 ) -> dict[str, float]:
     """
-    Positive control: Oracle ranker (predictions = actual values).
-    
-    Expected: IC = 1.0, Precision = 1.0, Lift = maximum possible
+    Positive control: Oracle ranker.
+
+    NOTE: The rank-metric implementation treats LOWER scores as better.
+    So we use score = -y_true so that "best" items have the smallest scores.
+
+    Expected: Precision@3 ≈ 1.0, Lift@3 near the maximum possible.
     
     Returns:
         dict with rank_ic, precision@3, lift@3
     """
     from ModularMonolith.src.reporting.metrics_rank import compute_rank_metrics
     
-    # Use actual values as predictions (perfect oracle)
-    metrics = compute_rank_metrics(y_true, y_true, groups)
+    y_arr = np.asarray(y_true).ravel().astype(float)
+    # Score convention: lower is better.
+    y_pred = -y_arr
+    metrics = compute_rank_metrics(y_arr, y_pred, groups)
     
     return {
-        "oracle_rank_ic": metrics.rank_ic,
+        # IC sign depends on score direction; report absolute value as a
+        # magnitude-only positive control.
+        "oracle_rank_ic": float(abs(metrics.rank_ic)),
+        "oracle_rank_ic_signed": float(metrics.rank_ic),
         "oracle_precision@3": metrics.precision_at_3,
         "oracle_lift@3": metrics.lift_at_3,
     }
