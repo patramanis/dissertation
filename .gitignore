@@ -206,34 +206,38 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-
-
 # ---- Python ----
-# Αγνοεί τον φάκελο του virtual environment
 .venv/
 .venv312/
-
-# Αγνοεί τα αρχεία cache της Python
 __pycache__/
 *.pyc
+*__pycache__/
 
 # Results artifacts
 results/
+*.csv
+*.parquet
+*.json
+*.pkl
+*.txt
+*.ubj
+*.pdf
+*.png
+*.log
+*.md
+*.ini
+*.pyc
 
-# ---- Project-specific ignores ----
-code/
-data/
-
+# Project-specific ignores
 FTI/
-
-ModularMonolith/**
-!ModularMonolith/**/
-!ModularMonolith/**/*.py
-
-ModularMonolith/data/**/*.parquet
-ModularMonolith/data/**/*.png
-
-ModularMonolith/data/**/Graphs/
-ModularMonolith/data/**/Graphs/**
-
+code/
+ModularMonolith/
+runs/
 diagnostics/
+docs/
+
+# Exceptions
+!sector-rotation/
+!sector-rotation/src/
+!sector-rotation/tests/
+!sector-rotation/src/backtests/
